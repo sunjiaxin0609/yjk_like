@@ -26,12 +26,14 @@
 #include <vector>
 
 #include "SceneData.h"
+#include "View3D.h"
 #include "yjk/analysis/StaticAnalysis.h"
 #include "yjk/io/ModelScript.h"
 #include "yjk/model/Model.h"
 #include "yjk/post/PostProcessor.h"
 
 class QAction;
+class QActionGroup;
 class QCheckBox;
 class QComboBox;
 class QLabel;
@@ -44,7 +46,6 @@ namespace ui {
 namespace io = yjk::io;
 using yjk::StaticAnalysis;
 
-class View3D;
 class ModelTreePanel;
 class PropertyPanel;
 class ResultPanel;
@@ -86,6 +87,13 @@ class MainWindow : public QMainWindow {
   void onExportShot();
   void onAbout();
   void onViewOptionsChanged();
+
+  // ---- T4 交互建模（工具 action → 视口信号 → 状态机 → BuildOps）----
+  void onToolTriggered(View3D::BuildTool t);
+  void onBuildNodeHit(int node);                    // 视口单击节点
+  void onBuildBoxNodes(const std::vector<int>& nodes);  // 视口框选完成
+  void onBuildEscaped();                            // Esc 退出工具
+  void onBuildToolChanged(View3D::BuildTool t);     // 同步 action 勾选态
 
  private:
   void buildActions();
@@ -133,6 +141,21 @@ class MainWindow : public QMainWindow {
   PropertyPanel* prop_{nullptr};
   ResultPanel* results_{nullptr};
   QPlainTextEdit* log_{nullptr};
+
+  // ---- T4 创建工具状态机 ----
+  // 工具激活时在视口点节点：梁/柱攒 2 点、墙攒 4 点、节点荷载 1 点弹对话框；
+  // 攒够即调 BuildOps 提交，成功后走 refreshAfterBuild()（结果失效铁律③）。
+  void gatherBuildNode(int node);
+  void commitBuild(const std::vector<Id>& ids, View3D::BuildTool t);
+  void refreshAfterBuild();
+  View3D::BuildTool buildTool_{View3D::BuildTool::None};
+  std::vector<int> pendingNodes_;
+  QAction* actToolBeam_{nullptr};
+  QAction* actToolColumn_{nullptr};
+  QAction* actToolWall_{nullptr};
+  QAction* actToolSlab_{nullptr};
+  QAction* actToolLoad_{nullptr};
+  QActionGroup* toolGroup_{nullptr};   // 工具互斥（可勾选组）
 
   // ---- 工具栏控件 ----
   QAction* actOpen_{nullptr};

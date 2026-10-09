@@ -58,6 +58,7 @@ src/analysis/StaticAnalysis.cpp
 src/io/ModelScript.cpp
   src/io/YjkWriter.cpp
   src/interact/PickCore.cpp
+  src/interact/BuildOps.cpp
 )
 
 add_library(yjk_core STATIC ${YJK_CORE_SOURCES})

@@ -8,12 +8,17 @@
 #include <QApplication>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QDockWidget>
+#include <QDoubleSpinBox>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
 #include <QImage>
+#include <QInputDialog>
 #include <QLabel>
+#include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QPlainTextEdit>
@@ -33,9 +38,15 @@
 #include "ResultPanel.h"
 #include "Theme.h"
 #include "View3D.h"
+#include "yjk/interact/BuildOps.h"
 #include "yjk/post/ResultExport.h"
 
 namespace ui {
+
+namespace sec = yjk::section;
+using yjk::Material;
+using yjk::SectionProperties;
+using yjk::ShellProperties;
 
 namespace {
 
@@ -119,11 +130,18 @@ connect(results_, &ResultPanel::elementActivated, this, [this](int e, int t) {
   // 属性面板双击改参 -> 写回 Model（面板内部已做事务回滚）
   // -> modelEdited：结果失效 + 刷新视图/树 + 内存重算
   // -> editRejected：面板已恢复原值，这里只负责记日志
-  connect(prop_, &PropertyPanel::modelEdited, this, &MainWindow::onModelEdited);
+connect(prop_, &PropertyPanel::modelEdited, this, &MainWindow::onModelEdited);
   connect(prop_, &PropertyPanel::editRejected, this,
           [this](const QString& why) { log(why, true); });
 
+  // ---- T4 创建工具：视口事件 → 状态机 ----
+  connect(view_, &View3D::buildNodeHit, this, &MainWindow::onBuildNodeHit);
+  connect(view_, &View3D::buildBoxNodes, this, &MainWindow::onBuildBoxNodes);
+  connect(view_, &View3D::buildEscaped, this, &MainWindow::onBuildEscaped);
+  connect(view_, &View3D::buildToolChanged, this, &MainWindow::onBuildToolChanged);
+
   log(QStringLiteral("就绪。打开一个 .yjk 建模脚本，或直接点「开始计算」用内置示例试跑。"));
+  log(QStringLiteral("创建工具：B 梁 · C 柱 · W 墙 · P 板 · L 节点荷载（Esc 退出）"));
   setBusy(false);
 }
 
@@ -170,8 +188,41 @@ void MainWindow::buildActions() {
   actGrid_->setCheckable(true);
   actGrid_->setChecked(true);
 
-  actContour_ = new QAction(QStringLiteral("显示云图"), this);
+actContour_ = new QAction(QStringLiteral("显示云图"), this);
   actContour_->setCheckable(true);
+
+  // ---- T4 创建工具（B/C/W/P/L，WidgetShortcut → 输入框内不误触）----
+  auto mkTool = [this](const QString& text, const char* key, const QString& tip,
+                       View3D::BuildTool t) {
+    QAction* a = new QAction(text, view_);   // 归 view_ 所有：快捷键只在视口有焦点时生效
+    a->setCheckable(true);
+    a->setShortcut(QKeySequence(QString::fromUtf8(key)));
+    a->setShortcutContext(Qt::WidgetShortcut);
+    a->setToolTip(tip);
+    connect(a, &QAction::triggered, this,
+            [this, t] { onToolTriggered(t); });
+    return a;
+  };
+  actToolBeam_ = mkTool(QStringLiteral("画梁 (B)"), "B",
+                        QStringLiteral("两点定梁：依次点选起点、终点节点"),
+                        View3D::BuildTool::Beam);
+  actToolColumn_ = mkTool(QStringLiteral("画柱 (C)"), "C",
+                          QStringLiteral("两点定柱：依次点选底、顶节点"),
+                          View3D::BuildTool::Column);
+  actToolWall_ = mkTool(QStringLiteral("画墙 (W)"), "W",
+                        QStringLiteral("四角定墙：底左→底右→顶右→顶左"),
+                        View3D::BuildTool::Wall);
+  actToolSlab_ = mkTool(QStringLiteral("画板 (P)"), "P",
+                        QStringLiteral("框选定板：拖拽框选板所在区域的角点"),
+                        View3D::BuildTool::Slab);
+  actToolLoad_ = mkTool(QStringLiteral("节点荷载 (L)"), "L",
+                        QStringLiteral("点击节点施加集中力/力矩"),
+                        View3D::BuildTool::Load);
+  toolGroup_ = new QActionGroup(this);
+  toolGroup_->setExclusive(true);
+  for (QAction* a : {actToolBeam_, actToolColumn_, actToolWall_, actToolSlab_,
+                     actToolLoad_})
+    toolGroup_->addAction(a);
 }
 
 void MainWindow::buildMenus() {
@@ -227,6 +278,35 @@ void MainWindow::buildMenus() {
   aFit->setShortcut(Qt::Key_Home);
   connect(aFit, &QAction::triggered, this, [this] { view_->frameAll(); });
 
+// ---- 建模（T4 创建工具）----
+  auto* build = menuBar()->addMenu(QStringLiteral("建模(&M)"));
+  build->addAction(actToolBeam_);
+  build->addAction(actToolColumn_);
+  build->addAction(actToolWall_);
+  build->addAction(actToolSlab_);
+  build->addAction(actToolLoad_);
+  build->addSeparator();
+  build->addAction(QStringLiteral("退出创建工具 (Esc)"), this, [this] {
+    view_->setBuildTool(View3D::BuildTool::None);
+  });
+
+  // 视口右键菜单 = 同一组创建工具（常用操作少点几下）
+  view_->setContextMenuPolicy(Qt::CustomContextMenu);
+  connect(view_, &QWidget::customContextMenuRequested, this,
+          [this](const QPoint& pos) {
+            QMenu menu(this);
+            menu.addAction(actToolBeam_);
+            menu.addAction(actToolColumn_);
+            menu.addAction(actToolWall_);
+            menu.addAction(actToolSlab_);
+            menu.addAction(actToolLoad_);
+            menu.addSeparator();
+            menu.addAction(QStringLiteral("退出创建工具 (Esc)"), this, [this] {
+              view_->setBuildTool(View3D::BuildTool::None);
+            });
+            menu.exec(view_->mapToGlobal(pos));
+          });
+
   // ---- 计算 ----
   auto* calc = menuBar()->addMenu(QStringLiteral("计算(&C)"));
   calc->addAction(actCheck_);
@@ -269,9 +349,18 @@ void MainWindow::buildToolBar() {
   tb->addAction(actCheck_);
   tb->addAction(actRun_);
   tb->addSeparator();
-  tb->addAction(actSolid_);
+tb->addAction(actSolid_);
   tb->addAction(actDeform_);
   tb->addAction(actAnimate_);
+  tb->addSeparator();
+
+  // T4 创建工具
+  tb->addWidget(new QLabel(QStringLiteral(" 创建 "), tb));
+  tb->addAction(actToolBeam_);
+  tb->addAction(actToolColumn_);
+  tb->addAction(actToolWall_);
+  tb->addAction(actToolSlab_);
+  tb->addAction(actToolLoad_);
   tb->addSeparator();
 
   // 云图变量
@@ -600,6 +689,180 @@ void MainWindow::onReload() {
 // =============================================================================
 //  计算
 // =============================================================================
+// =============================================================================
+//  T4：交互建模（工具栏/菜单/右键/快捷键 B C W P L）
+//
+//  状态机：工具激活 → 视口单击节点（buildNodeHit）→ 攒够点即commit。
+//    梁 / 柱   2 点
+//    墙        4 点（底左→底右→顶右→顶左，与脚本 wall <a> <b> <c> <d> 同构）
+//    板        Slab 工具下拖拽框选，视口发 buildBoxNodes
+//    节点荷载  1 点，直接弹对话框输入力/矩
+//  提交走 yjk::interact::BuildOps（无 Qt 纯函数，与脚本层共用内核接口），
+//  成功后 refreshAfterBuild()：结果失效 + 刷新视图/树 + 若有结果则内存重算。
+// =============================================================================
+void MainWindow::onToolTriggered(View3D::BuildTool t) {
+  // 再次点同一个工具 = 退出（CAD 惯例：Esc / 再点一次都能退出）
+  if (buildTool_ == t) {
+    view_->setBuildTool(View3D::BuildTool::None);
+    return;
+  }
+  buildTool_ = t;
+  pendingNodes_.clear();
+  view_->setBuildTool(t);
+  QString tip;
+  switch (t) {
+    case View3D::BuildTool::Beam:
+      tip = QStringLiteral("梁工具：依次点击起点、终点节点；Esc 退出");
+      break;
+    case View3D::BuildTool::Column:
+      tip = QStringLiteral("柱工具：依次点击底、顶节点；Esc 退出");
+      break;
+    case View3D::BuildTool::Wall:
+      tip = QStringLiteral("墙工具：依次点击底左→底右→顶右→顶左；Esc 退出");
+      break;
+    case View3D::BuildTool::Slab:
+      tip = QStringLiteral("板工具：拖拽框选板四周节点；Esc 退出");
+      break;
+    case View3D::BuildTool::Load:
+      tip = QStringLiteral("荷载工具：点击节点施加荷载；Esc 退出");
+      break;
+    default:
+      break;
+  }
+  if (!tip.isEmpty()) statusBar()->showMessage(tip, 4000);
+}
+
+void MainWindow::onBuildToolChanged(View3D::BuildTool t) {
+  buildTool_ = t;
+  pendingNodes_.clear();
+  // 同步工具栏/菜单勾选态（Esc 退出后归位）
+  for (QAction* a :
+       {actToolBeam_, actToolColumn_, actToolWall_, actToolSlab_, actToolLoad_}) {
+    const bool on = (a == actToolBeam_ && t == View3D::BuildTool::Beam) ||
+                    (a == actToolColumn_ && t == View3D::BuildTool::Column) ||
+                    (a == actToolWall_ && t == View3D::BuildTool::Wall) ||
+                    (a == actToolSlab_ && t == View3D::BuildTool::Slab) ||
+                    (a == actToolLoad_ && t == View3D::BuildTool::Load);
+    a->setChecked(on);
+  }
+}
+
+void MainWindow::gatherBuildNode(int node) {
+  if (buildTool_ == View3D::BuildTool::None) return;
+  if (node < 0) {   // 点空白：不丢弃已选点？不 —— 建工具里点空就是点空，保持现状
+    return;
+  }
+  // 去重（同一节点连点两次没意义，视为一次点击）
+  for (int x : pendingNodes_)
+    if (x == node) return;
+  pendingNodes_.push_back(node);
+
+  const size_t need =
+      (buildTool_ == View3D::BuildTool::Wall) ? 4
+      : (buildTool_ == View3D::BuildTool::Beam ||
+         buildTool_ == View3D::BuildTool::Column)
+          ? 2
+          : 1;   // Load / Slab 立即处理
+  log(QStringLiteral("已选节点 #%1（%2/%3）")
+          .arg(node)
+          .arg(pendingNodes_.size())
+          .arg(need));
+
+  if (pendingNodes_.size() >= need) {
+    commitBuild(std::vector<Id>(pendingNodes_.begin(), pendingNodes_.end()),
+                buildTool_);
+    pendingNodes_.clear();
+  }
+}
+
+void MainWindow::commitBuild(const std::vector<Id>& ids, View3D::BuildTool t) {
+  if (!model_) return;
+  // 默认属性：C30 混凝土 + 矩形截面（用户之后可在属性面板细调 ——
+  // T3 已打通"改参即写回模型 + 自动重算"链路）。
+  const Material mat = Material::concreteC(30);
+  const SectionProperties sec = sec::rect(0.3, 0.6);
+  const ShellProperties shell;   // 默认厚度等内核取默认值
+
+  yjk::interact::BuildOpResult r;
+  switch (t) {
+    case View3D::BuildTool::Beam:
+      r = yjk::interact::placeBeam(*model_, ids[0], ids[1], sec, mat);
+      break;
+    case View3D::BuildTool::Column:
+      r = yjk::interact::placeColumn(*model_, ids[0], ids[1], sec, mat);
+      break;
+    case View3D::BuildTool::Wall:
+      r = yjk::interact::placeWall(*model_, {ids[0], ids[1], ids[2], ids[3]}, shell);
+      break;
+    case View3D::BuildTool::Slab:
+      r = yjk::interact::placeSlabFromNodes(*model_, ids, shell);
+      break;
+    case View3D::BuildTool::Load: {
+      // 节点荷载：弹框输入力/矩（6 分量），取消则不施加
+      const Id n = ids[0];
+      bool ok = false;
+      const double fx = QInputDialog::getDouble(
+          this, QStringLiteral("节点荷载"), QStringLiteral("集中力 Fx (kN) [0]"),
+          0.0, -1e6, 1e6, 2, &ok);
+      if (!ok) return;
+      const double fy = QInputDialog::getDouble(
+          this, QStringLiteral("节点荷载"), QStringLiteral("集中力 Fy (kN) [0]"),
+          0.0, -1e6, 1e6, 2, &ok);
+      if (!ok) return;
+      const double fz = QInputDialog::getDouble(
+          this, QStringLiteral("节点荷载"), QStringLiteral("集中力 Fz (kN) [0，向下为负]"),
+          0.0, -1e6, 1e6, 2, &ok);
+      if (!ok) return;
+      const double mx = QInputDialog::getDouble(
+          this, QStringLiteral("节点荷载"), QStringLiteral("力矩 Mx (kN·m) [0]"),
+          0.0, -1e6, 1e6, 2, &ok);
+      if (!ok) return;
+      const double my = QInputDialog::getDouble(
+          this, QStringLiteral("节点荷载"), QStringLiteral("力矩 My (kN·m) [0]"),
+          0.0, -1e6, 1e6, 2, &ok);
+      if (!ok) return;
+      const double mz = QInputDialog::getDouble(
+          this, QStringLiteral("节点荷载"), QStringLiteral("力矩 Mz (kN·m) [0]"),
+          0.0, -1e6, 1e6, 2, &ok);
+      if (!ok) return;
+      r = yjk::interact::placeNodeLoad(*model_, n, Vec3{fx, fy, fz},
+                                       Vec3{mx, my, mz});
+      break;
+    }
+    default:
+      return;
+  }
+
+  if (r.ok) {
+    log(QString::fromStdString(r.message));
+    refreshAfterBuild();
+  } else {
+    log(QStringLiteral("创建失败：%1").arg(QString::fromStdString(r.message)), true);
+    statusBar()->showMessage(QStringLiteral("创建失败：") +
+                                 QString::fromStdString(r.message),
+                             5000);
+  }
+}
+
+void MainWindow::refreshAfterBuild() {
+  if (!model_) return;
+  // 复用 T3 编辑链路：结果失效 + 刷新视图/树 + 自动重算（若有结果）
+  onModelEdited();
+}
+
+void MainWindow::onBuildNodeHit(int node) { gatherBuildNode(node); }
+
+void MainWindow::onBuildBoxNodes(const std::vector<int>& nodes) {
+  if (buildTool_ != View3D::BuildTool::Slab) return;
+  log(QStringLiteral("框选 %1 个节点").arg(nodes.size()));
+  commitBuild(std::vector<Id>(nodes.begin(), nodes.end()), buildTool_);
+}
+
+void MainWindow::onBuildEscaped() {
+  pendingNodes_.clear();
+  log(QStringLiteral("已退出创建工具"));
+}
+
 void MainWindow::onCheck() {
   if (!model_) {
     QMessageBox::information(this, QStringLiteral("模型校核"),

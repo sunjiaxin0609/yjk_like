@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "yjk/interact/BuildOps.h"
 #include "yjk/io/ModelScript.h"
 #include "yjk/io/YjkWriter.h"
 #include "yjk/model/Model.h"
@@ -543,12 +544,190 @@ static void testPropertyEdit() {
   checkInt(m.elementCount(), cp.elementCount(), "clone 后原模型完好可继续使用");
 }
 
+// -----------------------------------------------------------------------------
+//  6. T4 创建交互：BuildOps 与 .yjk 脚本同操作导出模型逐项等价 + 错误分支
+//
+//  验收对应 GUI 验收"GUI 与 .yjk 脚本同操作导出模型逐项等价"：
+//    用 GUI 同一套操作序列（placeColumn / placeBeam / placeWall /
+//    placeSlabFromNodes / placeNodeLoad，默认 C30 + rect(0.3,0.6)）建模型
+//    → modelToYjk 导出 → ModelScript 读回 → 节点/单元/荷载逐字段一致。
+//  另验证错误分支返回结构化中文消息（GUI 状态栏直接展示）。
+// -----------------------------------------------------------------------------
+static void testBuildOps() {
+  std::printf("\n== 6. T4 创建交互（BuildOps 与脚本等价 + 错误分支）==\n");
+
+  const Material conc = Material::concreteC(30);
+  const SectionProperties sec = section::rect(0.3, 0.6);
+  ShellProperties sp;       // 板：非默认厚度 0.12
+  sp.thickness = 0.12;
+  ShellProperties wp;       // 墙：非默认厚度 0.25
+  wp.thickness = 0.25;
+
+  // ---- 6a. 等价性：GUI 操作序列 → 序列化 → 读回，逐项一致 ----
+  Model src;
+  const Id n0 = src.addNode(Vec3{0, 0, 0}, 0);
+  const Id n1 = src.addNode(Vec3{6, 0, 0}, 0);
+  const Id n2 = src.addNode(Vec3{6, 6, 0}, 0);
+  const Id n3 = src.addNode(Vec3{0, 6, 0}, 0);
+  const Id n4 = src.addNode(Vec3{0, 0, 3.6}, 1);
+  const Id nMid = src.addNode(Vec3{3, 3, 0}, 0);  // 框选板内的冗余节点
+
+  // 与 GUI 完全相同的操作序列
+  const interact::BuildOpResult rc = interact::placeColumn(src, n0, n4, sec, conc);
+  check(rc.ok && rc.message.find("柱已创建") != std::string::npos, "GUI 同操作：placeColumn 成功");
+  const interact::BuildOpResult rb = interact::placeBeam(src, n1, n2, sec, conc);
+  check(rb.ok && rb.message.find("梁已创建") != std::string::npos, "GUI 同操作：placeBeam 成功");
+  // 墙取翘曲四边形 {0,1,4,3}（n3 在 y=6）——与脚本 wall 0 1 4 3 同构，必须接受
+  const interact::BuildOpResult rw =
+      interact::placeWall(src, std::array<Id, 4>{{n0, n1, n4, n3}}, wp);
+  check(rw.ok && rw.message.find("墙已创建") != std::string::npos, "GUI 同操作：placeWall 成功（翘曲四边形）");
+  // 框选：底面四角 + 框内冗余节点 → 取四角最近点定板
+  const interact::BuildOpResult rs =
+      interact::placeSlabFromNodes(src, {n0, n1, n2, n3, nMid}, sp);
+  check(rs.ok && rs.message.find("板已创建") != std::string::npos, "GUI 同操作：placeSlabFromNodes 成功");
+  const interact::BuildOpResult rl = interact::placeNodeLoad(src, n4, Vec3{10, 0, -20}, Vec3{0, 5, 0});
+  check(rl.ok && rl.id == n4, "GUI 同操作：placeNodeLoad 成功");
+
+  checkInt(src.nodeCount(), 6, "源模型 6 节点");
+  checkInt(src.elementCount(), 4, "源模型 4 单元（柱/梁/墙/板）");
+
+  // 序列化 → 读回
+  const std::string text = io::modelToYjk(src);
+  check(!text.empty(), "BuildOps 模型成功序列化为 .yjk 文本");
+  if (text.empty()) { ++g_fail; return; }
+  io::ModelScript script;
+  if (!script.parse(text)) {
+    ++g_fail;
+    std::printf("  [FAIL] 脚本解析失败：\n");
+    for (const auto& err : script.errors()) std::printf("       %s\n", err.c_str());
+    return;
+  }
+  Model dst;
+  std::string info;
+  if (!script.build(dst, &info)) {
+    ++g_fail;
+    std::printf("  [FAIL] 脚本建模失败：\n");
+    for (const auto& err : script.errors()) std::printf("       %s\n", err.c_str());
+    return;
+  }
+
+  checkInt(dst.nodeCount(), 6, "读回 6 节点");
+  checkInt(dst.elementCount(), 4, "读回 4 单元");
+  for (Id n = 0; n < src.nodeCount(); ++n) {
+    char buf[96];
+    std::snprintf(buf, sizeof buf, "节点 %lld 坐标一致", static_cast<long long>(n));
+    checkVecNear(dst.node(n).r, src.node(n).r, 1e-12, buf);
+    std::snprintf(buf, sizeof buf, "节点 %lld 层号一致", static_cast<long long>(n));
+    checkInt(dst.node(n).story, src.node(n).story, buf);
+  }
+
+  // 单元逐项：类型 / 节点引用 / 截面 / 材料 / 墙标志 / up
+  for (Id k = 0; k < src.elementCount(); ++k) {
+    const Element* se = src.element(k);
+    const Element* de = dst.element(k);
+    char buf[96];
+    std::snprintf(buf, sizeof buf, "单元 %lld 类型一致", static_cast<long long>(k));
+    check(de->type() == se->type(), buf);
+    std::snprintf(buf, sizeof buf, "单元 %lld 节点引用一致", static_cast<long long>(k));
+    check(de->nodes() == se->nodes(), buf);
+    switch (se->type()) {
+      case ElementType::Beam3D: {
+        const auto* sb = static_cast<const BeamElement*>(se);
+        const auto* db = static_cast<const BeamElement*>(de);
+        std::snprintf(buf, sizeof buf, "单元 %lld up 一致", static_cast<long long>(k));
+        checkVecNear(db->upHint(), sb->upHint(), 1e-12, buf);
+        std::snprintf(buf, sizeof buf, "单元 %lld 截面 A 一致", static_cast<long long>(k));
+        checkNear(db->section().A, sb->section().A, 1e-12, buf);
+        std::snprintf(buf, sizeof buf, "单元 %lld 材料 E 一致", static_cast<long long>(k));
+        checkNear(db->material().E, sb->material().E, 1e-12, buf);
+        break;
+      }
+      case ElementType::Shell4: {
+        const auto* ssh = static_cast<const ShellElement*>(se);
+        const auto* dsh = static_cast<const ShellElement*>(de);
+        std::snprintf(buf, sizeof buf, "单元 %lld 墙标志一致", static_cast<long long>(k));
+        check(dsh->isWall() == ssh->isWall(), buf);
+        std::snprintf(buf, sizeof buf, "单元 %lld 厚度一致", static_cast<long long>(k));
+        checkNear(dsh->properties().thickness, ssh->properties().thickness, 1e-12, buf);
+        break;
+      }
+      default: break;
+    }
+  }
+  // 关键语义复核：单元 0=柱(up{0,-1,0})、1=梁(up{0,0,-1})、2=墙、3=板
+  checkVecNear(static_cast<const BeamElement*>(dst.element(0))->upHint(),
+               Vec3{0, -1, 0}, 1e-12, "读回单元0（柱）up={0,-1,0}");
+  checkVecNear(static_cast<const BeamElement*>(dst.element(1))->upHint(),
+               Vec3{0, 0, -1}, 1e-12, "读回单元1（梁）up={0,0,-1}");
+  check(static_cast<const ShellElement*>(dst.element(2))->isWall(), "读回单元2 为墙");
+  check(!static_cast<const ShellElement*>(dst.element(3))->isWall(), "读回单元3 为板（非墙）");
+
+  // 荷载（addNodeLoad 是累加语义，但只施过一次 → 与 GUI 同操作一致）
+  checkVecNear(dst.node(n4).force, Vec3{10, 0, -20}, 1e-12, "读回节点荷载力一致");
+  checkVecNear(dst.node(n4).moment, Vec3{0, 5, 0}, 1e-12, "读回节点荷载力矩一致");
+  // 序列化文本应含 GUI 导出的同族命令
+  // （柱/梁统一序列化为 beam + 显式 up；柱的 up={0,-1,0} 方向必须保留）
+  check(text.find("beam ") != std::string::npos, "序列化含 beam（柱与梁）");
+  check(text.find(" 0 -1 0") != std::string::npos, "序列化保留柱 up 方向 {0,-1,0}");
+  check(text.find("wall ") != std::string::npos, "序列化含 wall");
+  check(text.find("shell ") != std::string::npos, "序列化含 shell（板）");
+
+  // ---- 6b. 错误分支：结构化中文消息，GUI 直接展示 ----
+  std::printf("  -- 错误分支 --\n");
+  Model e;
+  const Id a0 = e.addNode(Vec3{0, 0, 0});
+  const Id a1 = e.addNode(Vec3{6, 0, 0});
+
+  {
+    const auto r = interact::placeColumn(e, a0, 99, sec, conc);
+    check(!r.ok && r.message.find("柱：节点不存在") != std::string::npos,
+          "柱：越界节点被拒且给出中文消息");
+  }
+  {
+    const auto r = interact::placeBeam(e, a0, a0, sec, conc);
+    check(!r.ok && r.message.find("零长度单元") != std::string::npos,
+          "梁：同一节点（零长度）被拒");
+  }
+  {
+    const auto r = interact::placeWall(e, std::array<Id, 4>{{a0, a1, a1, a0}} , wp);
+    check(!r.ok && r.message.find("重复") != std::string::npos,
+          "墙：四角有重复节点被拒");
+  }
+  {
+    // 四点共线：(0,0,0) (6,0,0) (12,0,0) (18,0,0)
+    const Id b0 = e.addNode(Vec3{12, 0, 0});
+    const Id b1 = e.addNode(Vec3{18, 0, 0});
+    const auto r = interact::placeWall(e, std::array<Id, 4>{{a0, a1, b0, b1}}, wp);
+    check(!r.ok && r.message.find("共线") != std::string::npos,
+          "墙：四点共线被拒");
+  }
+  {
+    // 引用已被删除（retired）的孤立节点
+    const Id iso = e.addNode(Vec3{50, 50, 50});
+    check(e.removeNode(iso), "准备：删除孤立节点 iso");
+    const auto r = interact::placeBeam(e, a0, iso, sec, conc);
+    check(!r.ok && r.message.find("节点不存在") != std::string::npos,
+          "梁：引用 retired 节点被拒");
+  }
+  {
+    const auto r = interact::placeSlabFromNodes(e, {a0, a1}, sp);
+    check(!r.ok && r.message.find("框选范围内节点不足") != std::string::npos,
+          "板：框选不足 4 节点被拒");
+  }
+  {
+    const auto r = interact::placeNodeLoad(e, 99, Vec3{0, 0, -1});
+    check(!r.ok && r.message.find("节点荷载：节点不存在") != std::string::npos,
+          "节点荷载：越界节点被拒");
+  }
+}
+
 int main() {
   testMutableApi();
   testRoundTrip();
   testScriptEquivalence();
   testClearRebuild();
   testPropertyEdit();
+  testBuildOps();
 
   std::printf("\n====  test_interact：%d 通过，%d 失败 ====\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;

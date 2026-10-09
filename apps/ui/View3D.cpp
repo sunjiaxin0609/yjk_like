@@ -311,9 +311,18 @@ void View3D::paintEvent(QPaintEvent*) {
   drawScene(p, vp);
   p.restore();
 
-  drawAxisTriad(p, vp);
+drawAxisTriad(p, vp);
   drawColorBar(p, vp);
   drawHud(p, vp);
+
+  // 工具态框选橡皮筋（在 HUD 之上画，保证可见）
+  if (boxSelecting_ && buildTool_ != BuildTool::None) {
+    QRect r(boxAnchor_, boxCur_);
+    r = r.normalized();
+    p.setPen(QPen(Member::selected(), 1.2, Qt::DashLine));
+    p.setBrush(QColor(96, 165, 250, 36));
+    p.drawRect(r);
+  }
 }
 
 void View3D::drawBackground(QPainter& p, const QRect& vp) {
@@ -625,6 +634,29 @@ void View3D::drawHud(QPainter& p, const QRect& vp) {
     }
   }
 
+// 工具态：底部提示当前创建工具（叠加在鼠标提示之上）
+  if (buildTool_ != BuildTool::None) {
+    const char* tname = "创建";
+    switch (buildTool_) {
+      case BuildTool::Beam:   tname = "梁"; break;
+      case BuildTool::Column: tname = "柱"; break;
+      case BuildTool::Wall:   tname = "墙"; break;
+      case BuildTool::Slab:   tname = "板"; break;
+      case BuildTool::Load:   tname = "节点荷载"; break;
+      default: break;
+    }
+    const QString tip = QStringLiteral("【%1】左键点选节点，拖拽框选；Esc 退出工具")
+                            .arg(QString::fromUtf8(tname));
+    const QFontMetricsF fm(p.font());
+    const QRectF box2(vp.left() + 10, vp.bottom() - 22,
+                      fm.horizontalAdvance(tip) + 18, fm.height() + 8);
+    p.setPen(Qt::NoPen);
+    p.setBrush(QColor(0, 90, 160, 200));
+    p.drawRoundedRect(box2, 4, 4);
+    p.setPen(Qt::white);
+    p.drawText(box2.adjusted(9, 2, -9, -2), Qt::AlignVCenter | Qt::AlignLeft, tip);
+  }
+
   // 底部：鼠标提示
   if (!hint_.isEmpty()) {
     const QFontMetricsF fm(p.font());
@@ -717,6 +749,16 @@ void View3D::mousePressEvent(QMouseEvent* e) {
   lastPos_ = e->pos();
   setFocus();
 
+  // 工具态：左键按下 = 进入"点击拾取节点 / 拖拽框选"。
+  // 旋转留给中键 / Shift+左键（CAD 惯例：建模时轨道旋转不常用）。
+  if (buildTool_ != BuildTool::None && e->button() == Qt::LeftButton &&
+      !(e->modifiers() & Qt::ShiftModifier)) {
+    boxSelecting_ = true;
+    boxAnchor_ = boxCur_ = e->pos();
+    setCursor(Qt::CrossCursor);
+    return;
+  }
+
   // 中键 = 平移，这是 CAD/CAE 的通用约定。
   // 也支持 Shift + 左键，因为很多笔记本没有中键。
   if (e->button() == Qt::MiddleButton ||
@@ -731,6 +773,13 @@ void View3D::mousePressEvent(QMouseEvent* e) {
 
 void View3D::mouseMoveEvent(QMouseEvent* e) {
   const QPoint d = e->pos() - lastPos_;
+
+  // 工具态框选：更新橡皮筋矩形（拖动即选择，无需区分点击/拖拽）
+  if (boxSelecting_) {
+    boxCur_ = e->pos();
+    update();
+    return;
+  }
 
   if (rotating_) {
     cam_.orbit(d.x(), d.y());
@@ -799,6 +848,22 @@ void View3D::mouseReleaseEvent(QMouseEvent* e) {
   rotating_ = false;
   panning_ = false;
   unsetCursor();
+
+  // ---- 工具态：点击 = 拾取节点；拖拽 = 框选（Slab 用）----
+  if (boxSelecting_) {
+    boxSelecting_ = false;
+    const bool dragged = (e->pos() - boxAnchor_).manhattanLength() >= 4;
+    if (!dragged) {
+      // 单击：拾取节点（工具态只认节点，选中已有构件无意义 ——
+      // 创建语义是"点在一根梁上 = 找它最近的节点"由 pickAt 保证）
+      emit buildNodeHit(pickNodeAt(e->pos()));
+    } else {
+      // 拖拽框选：把框内节点 id 交给主窗口做状态机
+      emit buildBoxNodes(boxNodesAt(QRect(boxAnchor_, boxCur_)));
+    }
+    update();
+    return;
+  }
 
   // 点击（几乎没拖动）才算拾取。
   // 【必须判断这个】否则每次旋转结束都会顺手选中一个构件，
@@ -877,10 +942,75 @@ void View3D::keyPressEvent(QKeyEvent* e) {
     case Qt::Key_4:     setPreset(Camera::Preset::Top);    return;
     case Qt::Key_O:     setOrtho(!ortho());                return;
     case Qt::Key_Space: setAnimating(!animating());        return;
-    case Qt::Key_Escape: clearSelection();                 return;
+    case Qt::Key_Escape:
+      if (buildTool_ != BuildTool::None) {
+        // 工具态 Esc = 退出工具（不清选中态，主窗口负责恢复动作状态）
+        buildTool_ = BuildTool::None;
+        update();
+        emit buildToolChanged(buildTool_);
+        emit buildEscaped();
+        return;
+      }
+      clearSelection();
+      return;
     default: break;
   }
   QWidget::keyPressEvent(e);
+}
+
+int View3D::pickNodeAt(const QPoint& pos) const {
+  if (!model_) return -1;
+  const QRect vp = viewport();
+  if (!vp.contains(pos)) return -1;
+
+  const QVector3D eye = cam_.eye();
+  const QVector3D dir = cam_.unproject(pos.x(), pos.y(), vp) - eye;
+  const double tMax = cam_.radius() * 12.0 + 1.0;
+  const double worldPerPix = worldPerPixAt(cam_, vp);
+  const double nodeR = 8.0 * worldPerPix;   // 工具态容差略大于悬停拾取
+
+  std::vector<yjk::interact::PickNode> nodes;
+  nodes.reserve(scene_.pickNodes.size());
+  for (const Scene::PickNode& pn : scene_.pickNodes) {
+    nodes.push_back({static_cast<yjk::Id>(pn.id),
+                     {pn.p.x(), pn.p.y(), pn.p.z()}});
+  }
+  const yjk::interact::PickHit hit = yjk::interact::pickNearest(
+      yjk::interact::Ray3({eye.x(), eye.y(), eye.z()},
+                          {dir.x(), dir.y(), dir.z()}),
+      nodes, {}, {}, nodeR, nodeR, tMax);
+  return hit.kind == yjk::interact::PickKind::Node
+             ? static_cast<int>(hit.id)
+             : -1;
+}
+
+void View3D::setBuildTool(BuildTool t) {
+  if (buildTool_ == t) return;
+  buildTool_ = t;
+  boxSelecting_ = false;
+  unsetCursor();
+  update();
+  emit buildToolChanged(t);
+}
+
+std::vector<int> View3D::boxNodesAt(const QRect& box) const {
+  std::vector<int> ids;
+  if (!model_) return ids;
+  const QRect vp = viewport();
+  if (vp.isEmpty()) return ids;
+  const QRect nb = box.normalized().intersected(vp);
+  if (nb.width() < 4 || nb.height() < 4) return ids;
+
+  // 所有可见节点投影到屏幕，落在框内的都要。
+  // 直接用 scene_.pickNodes（含变形、与射线拾取同一套），保证
+  // "看到的节点 = 能被框到的节点"。
+  QMatrix4x4 vpMat = proj_.valid ? proj_.vp : cam_.viewProjection(vp);
+  for (const Scene::PickNode& pn : scene_.pickNodes) {
+    QPointF s;
+    if (!cam_.project(pn.p, vp, vpMat, &s)) continue;
+    if (nb.contains(s.toPoint())) ids.push_back(pn.id);
+  }
+  return ids;
 }
 
 void View3D::leaveEvent(QEvent*) {

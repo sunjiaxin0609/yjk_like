@@ -67,11 +67,19 @@ class View3D : public QWidget {
   void setAnimating(bool on);
   bool animating() const { return animating_; }
 
-  void setHighlightExtreme(int elem, int type);
+void setHighlightExtreme(int elem, int type);
   void clearSelection();
   void selectElement(int elem, int type);
   const std::vector<int>& selection() const { return sel_; }
   int selectionType() const { return selType_; }
+
+  // ---- T4 创建工具 ----
+  // 工具态下左键单击 = 拾取节点（发 buildNodeHit），左键拖拽 = 框选
+  // （Slab 工具收集框内节点发 buildBoxNodes），Esc = 退出（buildEscaped）。
+  // 旋转在中键 / Shift+左键；滚轮缩放不受影响。
+  enum class BuildTool { None, Beam, Column, Wall, Slab, Load };
+  void setBuildTool(BuildTool t);
+  BuildTool buildTool() const { return buildTool_; }
 
   QImage grabImage();      // 导出截图
 
@@ -81,6 +89,11 @@ class View3D : public QWidget {
   void selectionChanged();
   void viewChanged();
   void hoverChanged(int elem, int type);
+  // T4 工具事件（工具态下由视口发出，主窗口负责状态机）
+  void buildNodeHit(int node);              // 单击；-1 = 点空白
+  void buildBoxNodes(const std::vector<int>& nodes);  // 框选完成（Slab）
+  void buildEscaped();                      // Esc 退出创建工具
+  void buildToolChanged(View3D::BuildTool t);
 
  protected:
   void paintEvent(QPaintEvent*) override;
@@ -108,6 +121,11 @@ class View3D : public QWidget {
   void drawHud(QPainter& p, const QRect& vp);
 
   int pickAt(const QPoint& pos, int* type) const;
+  // T4 工具辅助：只拾取节点（点中梁/壳时返回其最近节点 —— 建模工具里
+  // "点在线中间"应选中端点，而不是拿起整个构件）
+  int pickNodeAt(const QPoint& pos) const;
+  // 把世界空间节点投影进屏幕，收集落在框内的节点 id
+  std::vector<int> boxNodesAt(const QRect& box) const;
 
   const Model* model_{nullptr};
   const StaticResult* result_{nullptr};
@@ -128,9 +146,14 @@ class View3D : public QWidget {
   };
   ProjCache proj_;
 
-  QPoint lastPos_;
+QPoint lastPos_;
   bool rotating_{false};
   bool panning_{false};
+
+  // T4 创建工具状态
+  BuildTool buildTool_{BuildTool::None};
+  bool boxSelecting_{false};
+  QPoint boxAnchor_, boxCur_;
 
 std::vector<int> sel_;
   int selType_{0};
