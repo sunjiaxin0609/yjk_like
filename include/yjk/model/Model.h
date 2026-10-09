@@ -158,11 +158,19 @@ class Element {
  public:
   virtual ~Element() = default;
 
-  // ---- 拓扑 ----
+// ---- 拓扑 ----
   virtual int nodeCount() const = 0;
   virtual int dofPerNode() const = 0;                 // 梁 6，壳 6
   virtual const std::vector<Id>& nodes() const = 0;
   int localDofs() const { return nodeCount() * dofPerNode(); }
+
+  // 深拷贝（T3 内存重算快照用）。
+  // 【为什么必须有】Model 持 unique_ptr<Element>，默认拷贝构造被禁用；
+  // 而"GUI 编辑后重算"必须在后台线程拿到一份独立的模型副本
+  // （assignDofs 会写 nodes_[].dof[]，与 UI 线程并发读写同一模型是数据竞争）。
+  // 各子类成员都是值语义（BeamElement3D 等含普通数组，无堆资源），
+  // 用 make_unique<X>(*this) 即可完成逐成员拷贝。
+  virtual std::unique_ptr<Element> clone() const = 0;
 
   // 可变引用 —— 仅供【拓扑修复】使用（见 mergeCoincidentNodes）。
   // 正常建模路径不应改单元的拓扑：改了就等于换了一个单元，
@@ -243,12 +251,26 @@ class BeamElement : public Element {
     be_.init(pi, pj, sec_, mat_, up_);
     return be_.isValid();
   }
-  const std::string& error() const { return be_.error(); }
+const std::string& error() const { return be_.error(); }
   const BeamElement3D& core() const { return be_; }
   const SectionProperties& section() const { return sec_; }
   const Material& material() const { return mat_; }
   Vec3 upHint() const { return up_; }
   void setUpHint(const Vec3& v) { up_ = v; }
+
+  // T3 属性编辑：改截面与材料。只改成员；调用方（Model::setBeamProps）
+  // 负责随后重建几何。be_.init 不触碰 relI_/relJ_（端部释放）与
+  // segs_/pt_/selfWeightOn_（荷载），故重 build 安全。
+  void setSectionAndMaterial(const SectionProperties& sec, const Material& mat) {
+    sec_ = sec;
+    mat_ = mat;
+  }
+
+  std::unique_ptr<Element> clone() const override {
+    // BeamElement 成员全部值语义（BeamElement3D be_ 内部是普通数组），
+    // 默认拷贝构造即正确深拷贝。
+    return std::make_unique<BeamElement>(*this);
+  }
 
 // ---- Element ----
   int nodeCount() const override { return 2; }
@@ -408,9 +430,17 @@ class ShellElement : public Element {
     if (!sh_.isValid()) { err_ = sh_.error(); return false; }
     return true;
   }
-  const std::string& error() const { return err_.empty() ? sh_.error() : err_; }
+const std::string& error() const { return err_.empty() ? sh_.error() : err_; }
   const ShellElement4& core() const { return sh_; }
   const ShellProperties& properties() const { return props_; }
+
+  // T3 属性编辑：改壳属性（厚度 / E / ν / 密度）。只改成员；
+  // 调用方（Model::setShellProps）负责随后 rebuild 几何。
+  void setProperties(const ShellProperties& props) { props_ = props; }
+
+  std::unique_ptr<Element> clone() const override {
+    return std::make_unique<ShellElement>(*this);
+  }
 
   int nodeCount() const override { return 4; }
   int dofPerNode() const override { return 6; }
@@ -511,6 +541,10 @@ class SpringElement : public Element {
   const std::array<double, 6>& stiffness() const { return k_; }
   Vec3 upHint() const { return up_; }
   void setUpHint(const Vec3& v) { up_ = v; }
+
+  std::unique_ptr<Element> clone() const override {
+    return std::make_unique<SpringElement>(*this);
+  }
 
   // ---- Element ----
   int nodeCount() const override { return 2; }
@@ -679,6 +713,32 @@ std::vector<std::unique_ptr<Element>>& elements() { return elems_; }
 
   // 节点荷载（力 + 力矩）一次性施加；M 缺省为零。
   void addNodeLoad(Id n, const Vec3& F, const Vec3& M = Vec3{0, 0, 0});
+
+  // ---- P3.5 属性编辑（T3）：GUI 改参写回 ----
+  //
+  // 【写回语义】坐标/截面/材料都是单元的"几何输入"——改完必须重建单元
+  // （局部轴系、刚度、质量都固化在 build 时的几何里）。三个 setter 都
+  // 遵循"先备份 → 改 → 重建 → 失败回滚"的事务语义：
+  //   成功：返回 true，模型已更新（含所有引用该节点的单元重 build）；
+  //   失败：恢复原值并重建回旧几何，返回 false，调用方应恢复界面显示。
+
+  // 改节点坐标：更新坐标并重建所有引用该节点的单元几何。
+  // 任一元 build 失败（如两节点重合 → 零长度）则回滚整体坐标。
+  bool setNodeCoord(Id n, const Vec3& r);
+
+  // 改梁截面 + 材料（合并成一次写回，避免改两遍触发两次几何重建）。
+  bool setBeamProps(Id idx, const SectionProperties& sec, const Material& mat);
+
+  // 改壳属性（墙厚 = thickness）。厚度变大 → 刚度与自重随之更新。
+  bool setShellProps(Id idx, const ShellProperties& props);
+
+  // 覆盖式设置节点力/力矩（区别于 addNodeLoad 的累加语义：
+  // 属性面板编辑"显示的就是当前值"，再点一次保存仍是同一个值）。
+  void setNodeForce(Id n, const Vec3& F);
+  void setNodeMoment(Id n, const Vec3& M);
+
+  // 深拷贝整个模型（GUI 编辑后"内存重算"的后台线程快照）。
+  Model clone() const;
 
   // 删除第 idx 个单元。后续单元的序号整体前移 —— 交互层删除后
   // 必须刷新选中态（T5 命令模式用"重建选中态"恢复，不依赖旧 id）。

@@ -4,6 +4,7 @@
 #include "yjk/model/Model.h"
 
 #include <algorithm>
+#include <cmath>
 #include <numeric>
 #include <set>
 #include <sstream>
@@ -118,6 +119,127 @@ void Model::addNodeLoad(Id n, const Vec3& F, const Vec3& M) {
   if (n < 0 || n >= nodeCount()) return;
   addNodeForce(n, F);
   addNodeMoment(n, M);
+}
+
+// -----------------------------------------------------------------------------
+//  P3.5 属性编辑（T3）：GUI 改参写回
+// -----------------------------------------------------------------------------
+
+// 按当前节点坐标重建单个单元。build 是"几何重算"：对梁/弹簧重算
+// 局部轴系与长度，对壳重算平面几何 —— 不触碰端部释放与荷载（见
+// BeamElement3D::init 注释）。返回 false 表示几何退化（零长度/共线）。
+namespace {
+bool rebuildElement(Model& m, Element& e) {
+  switch (e.type()) {
+    case ElementType::Beam3D: {
+      auto& b = static_cast<BeamElement&>(e);
+      const auto& ns = b.nodes();
+      return b.build(m.coord(ns[0]), m.coord(ns[1]));
+    }
+    case ElementType::Spring3D: {
+      auto& s = static_cast<SpringElement&>(e);
+      const auto& ns = s.nodes();
+      return s.build(m.coord(ns[0]), m.coord(ns[1]));
+    }
+    case ElementType::Shell4: {
+      auto& sh = static_cast<ShellElement&>(e);
+      std::vector<Vec3> pts;
+      pts.reserve(sh.nodes().size());
+      for (Id n : sh.nodes()) pts.push_back(m.coord(n));
+      return sh.build(pts);
+    }
+  }
+  return false;
+}
+}  // namespace
+
+bool Model::setNodeCoord(Id n, const Vec3& r) {
+  if (n < 0 || n >= nodeCount()) return false;
+  const Node& nd = nodes_[static_cast<size_t>(n)];
+  if (nd.retired) return false;                       // 已合并退役的节点不再可编辑
+
+  const Vec3 old = nd.r;
+
+  // 第一步：更新坐标（先不落盘，准备提交）
+  nodes_[static_cast<size_t>(n)].r = r;
+
+  // 第二步：重建所有引用该节点的单元。任一元失败 → 整体回滚。
+  for (auto& e : elems_) {
+    const auto& ns = e->nodes();
+    if (std::find(ns.begin(), ns.end(), n) == ns.end()) continue;
+    if (!rebuildElement(*this, *e)) {
+      // 回滚：坐标恢复 + 所有受影响单元重建回旧几何
+      nodes_[static_cast<size_t>(n)].r = old;
+      for (auto& e2 : elems_) {
+        const auto& ns2 = e2->nodes();
+        if (std::find(ns2.begin(), ns2.end(), n) == ns2.end()) continue;
+        rebuildElement(*this, *e2);
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
+bool Model::setBeamProps(Id idx, const SectionProperties& sec, const Material& mat) {
+  Element* el = element(idx);
+  if (!el || el->type() != ElementType::Beam3D) return false;
+  if (!sec.isValid()) return false;
+  // 材料参数与 PropertyPanel::applyEdit 的校验口径一致：
+  // E、γ 必须为正，ν ∈ (-1, 0.5)。不在这里拦的话，非法材料会直接
+  // 进单元刚度（E=0 → 零刚度 → 奇异矩阵），错误升级成求解期崩溃。
+  if (!(mat.E > 0) || !std::isfinite(mat.E)) return false;
+  if (!(mat.nu > -1.0 && mat.nu < 0.5)) return false;
+  if (!(mat.gamma > 0) || !std::isfinite(mat.gamma)) return false;
+  auto& b = static_cast<BeamElement&>(*el);
+  const auto& ns = b.nodes();
+  const SectionProperties oldSec = b.section();
+  const Material oldMat = b.material();
+
+  b.setSectionAndMaterial(sec, mat);
+  if (!rebuildElement(*this, *el)) {                  // 理论上几何不变不会失败，防御性回滚
+    b.setSectionAndMaterial(oldSec, oldMat);
+    rebuildElement(*this, *el);
+    return false;
+  }
+  return true;
+}
+
+bool Model::setShellProps(Id idx, const ShellProperties& props) {
+  Element* el = element(idx);
+  if (!el || el->type() != ElementType::Shell4) return false;
+  std::string why;
+  if (!props.isValid(&why)) return false;
+  auto& sh = static_cast<ShellElement&>(*el);
+  const ShellProperties oldProps = sh.properties();
+
+  sh.setProperties(props);
+  if (!rebuildElement(*this, *el)) {
+    sh.setProperties(oldProps);
+    rebuildElement(*this, *el);
+    return false;
+  }
+  return true;
+}
+
+void Model::setNodeForce(Id n, const Vec3& F) {
+  if (n < 0 || n >= nodeCount()) return;
+  nodes_[static_cast<size_t>(n)].force = F;
+}
+
+void Model::setNodeMoment(Id n, const Vec3& M) {
+  if (n < 0 || n >= nodeCount()) return;
+  nodes_[static_cast<size_t>(n)].moment = M;
+}
+
+Model Model::clone() const {
+  Model c(numbering_.mode());
+  c.nodes_ = nodes_;
+  c.elems_.reserve(elems_.size());
+  for (const auto& e : elems_) c.elems_.push_back(e->clone());
+  c.links_ = links_;
+  c.diaphragms_ = diaphragms_;
+  return c;
 }
 
 bool Model::removeElement(Id idx) {

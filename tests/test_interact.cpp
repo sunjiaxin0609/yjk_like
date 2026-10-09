@@ -455,11 +455,100 @@ static void testClearRebuild() {
   checkInt(m.elementCount(), 0, "clear 后单元归零");
 }
 
+// -----------------------------------------------------------------------------
+//  5. T3 属性编辑：setNodeCoord / setBeamProps / setShellProps /
+//     setNodeForce/setNodeMoment / Model::clone
+//
+//  验收对应 GUI 验收"改参后渲染与重算随之更新"：
+//    · 改坐标 → 梁长度/质量立即变化（几何重建成功）
+//    · 改到零长度 → 被拒绝且坐标回滚（几何退化保护）
+//    · 加大截面 → 局部刚度阵变大（能算得更刚）
+//    · 改壳厚度 → 厚度读回一致（写回成功）
+//    · 节点荷载覆盖式写回
+//    · clone 是独立深拷贝（GUI 重算快照不污染主模型）
+// -----------------------------------------------------------------------------
+static void testPropertyEdit() {
+  std::printf("\n== 5. T3 属性编辑 ==");
+
+  Model m;
+  const Id n0 = m.addNode(Vec3{0, 0, 0});
+  const Id n1 = m.addNode(Vec3{6, 0, 0});
+  const Material conc = Material::concreteC(30);
+  BeamElement* beam = m.addBeam(n0, n1, section::rect(0.3, 0.6), conc);
+  check(beam != nullptr, "addBeam 成功");
+  if (!beam) return;
+  const double l0 = m.element(0)->length();
+  checkNear(l0, 6.0, 1e-12, "梁初始长度 6 m");
+
+  // -- 5a. setNodeCoord：改坐标 → 长度/质量联动 --
+  check(m.setNodeCoord(n1, Vec3{3, 0, 0}), "setNodeCoord 移动到 (3,0,0) 成功");
+  checkNear(m.element(0)->length(), 3.0, 1e-12, "梁长度随坐标变为 3 m");
+  checkNear(m.element(0)->mass(), conc.gamma * 0.3 * 0.6 * 3.0, 1e-9,
+            "梁质量随长度更新（=γ·A·L）");
+  const double lShort = m.element(0)->length();
+
+  // -- 5b. setNodeCoord：退化回滚 --
+  check(!m.setNodeCoord(n1, Vec3{0, 0, 0}), "移到位移处使单元零长度 → 拒绝");
+  checkNear(m.element(0)->length(), lShort, 1e-15, "拒绝后长度保持原值（回滚）");
+  checkVecNear(m.node(n1).r, Vec3{3, 0, 0}, 1e-15, "拒绝后节点坐标回滚到 (3,0,0)");
+
+  // -- 5c. setBeamProps：加大截面 → 轴向刚度 EA/L 变大 --
+  const double kAxial0 = beam->section().A * beam->material().E / m.element(0)->length();
+  check(m.setBeamProps(0, section::rect(0.6, 1.0), conc), "setBeamProps 改大截面成功");
+  const double kAxial1 = beam->section().A * beam->material().E / m.element(0)->length();
+  checkNear(beam->section().A, 0.6, 1e-12, "截面 A 写回 = 0.6 m²");
+  check(kAxial1 > kAxial0 * 1.5, "轴向刚度 EA/L 显著变大");
+
+  // -- 5d. setBeamProps：非法材料被拒（E ≤ 0）--
+  Material bad = conc;
+  bad.E = 0.0;
+  check(!m.setBeamProps(0, section::rect(0.3, 0.6), bad),
+        "E=0 的材料写回被拒绝");
+  checkNear(beam->material().E, conc.E, 1e-12, "拒绝后材料 E 回滚为原值");
+
+  // -- 5e. setShellProps：墙厚翻倍写回 --
+  const std::vector<Id> sh = {n0, n1, m.addNode(Vec3{3, 3, 0}), m.addNode(Vec3{0, 3, 0})};
+  ShellElement* wall = m.addWall(sh, ShellProperties{});
+  check(wall != nullptr, "addWall 成功");
+  if (wall) {
+    ShellProperties p = wall->properties();
+    p.thickness = 0.4;
+    check(m.setShellProps(static_cast<Id>(m.elementCount() - 1), p), "setShellProps 厚度写回成功");
+    checkNear(wall->properties().thickness, 0.4, 1e-15, "壳厚度读回 = 0.4 m");
+    checkNear(wall->mass(), wall->area() * 0.4 * 2500.0 * 9.81 / 1000.0, 1e-9,
+              "壳自重随厚度更新（=γ·t·A）");
+  }
+
+  // -- 5f. 节点荷载：覆盖式写回 --
+  m.setNodeForce(n0, Vec3{10, 0, -20});
+  m.setNodeForce(n0, Vec3{5, 0, -5});
+  checkVecNear(m.node(n0).force, Vec3{5, 0, -5}, 1e-15, "setNodeForce 覆盖写回（不累加）");
+  m.setNodeMoment(n0, Vec3{0, 3, 0});
+  m.setNodeMoment(n0, Vec3{0, 0, 7});
+  checkVecNear(m.node(n0).moment, Vec3{0, 0, 7}, 1e-15, "setNodeMoment 覆盖写回（不累加）");
+
+  // -- 5g. clone：深拷贝独立，GUI 后台重算快照用 --
+  const double lenBefore = m.element(0)->length();
+  const Model cp = m.clone();
+  checkInt(cp.nodeCount(), m.nodeCount(), "clone 节点数一致");
+  checkInt(cp.elementCount(), m.elementCount(), "clone 单元数一致");
+  checkVecNear(cp.node(n1).r, m.node(n1).r, 1e-15, "clone 坐标一致");
+  checkNear(cp.element(0)->length(), lenBefore, 1e-15, "clone 梁长度一致");
+
+  // 改副本不污染原模型（GUI 线程克隆 → 后台快照求解 → 丢弃）
+  check(const_cast<Model&>(cp).setNodeCoord(n1, Vec3{9, 0, 0}),
+        "clone 副本可编辑");
+  checkNear(cp.element(0)->length(), 9.0, 1e-12, "副本长度变为 9 m");
+  checkNear(m.element(0)->length(), lenBefore, 1e-15, "原模型长度不受副本编辑影响");
+  checkInt(m.elementCount(), cp.elementCount(), "clone 后原模型完好可继续使用");
+}
+
 int main() {
   testMutableApi();
   testRoundTrip();
   testScriptEquivalence();
   testClearRebuild();
+  testPropertyEdit();
 
   std::printf("\n====  test_interact：%d 通过，%d 失败 ====\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;

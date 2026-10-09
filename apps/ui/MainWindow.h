@@ -96,13 +96,25 @@ class MainWindow : public QMainWindow {
 
   // 把当前 model_ 交给各面板 / 视口
   void publishModel();
-  void publishResults();
+  // autostyle=true 时自动切变形+云图+frameAll；属性编辑重算时传 false，
+  // 不打断编辑工作流（视角/云图状态保持）
+  void publishResults(bool autostyle = true);
   void clearResults();
   void setBusy(bool busy, const QString& what = QString());
 
   void log(const QString& s, bool error = false);
   void refreshFieldCombo();
   void syncOptionsToView();
+
+  // ---- T3 属性编辑 -> 内存重算 ----
+  // 属性面板改参后：结果失效 -> 刷新视图/树 -> 若之前有结果则后台重算。
+  // 【为什么不能复用 onRun】onRun 每次都从磁盘 .yjk 重新解析，
+  // 会把 GUI 里刚做的编辑整个丢掉。
+  void onModelEdited();
+  void recomputeFromMemory();
+  // 后台重算进行中又收到模型编辑时置位：当前重算结束后再补跑一次，
+  // 保证「重算结果 = 最后一次编辑后的模型」而不是吞掉中间修改。
+  bool pendingRecompute_{false};
 
   // ---- 数据（界面持有，生命周期覆盖所有面板）----
   std::unique_ptr<Model> model_;

@@ -108,12 +108,20 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     view_->selectElement(-1, 0);
   });
 
-  connect(results_, &ResultPanel::elementActivated, this, [this](int e, int t) {
+connect(results_, &ResultPanel::elementActivated, this, [this](int e, int t) {
     view_->selectElement(e, t);
     prop_->showElement(e, t);
     tree_->selectElement(e, t);
     setWindowTitle(QStringLiteral("yjk_like  ——  结构分析  [定位到单元 #%1]").arg(e));
   });
+
+  // ---- T3 属性编辑链路 ----
+  // 属性面板双击改参 -> 写回 Model（面板内部已做事务回滚）
+  // -> modelEdited：结果失效 + 刷新视图/树 + 内存重算
+  // -> editRejected：面板已恢复原值，这里只负责记日志
+  connect(prop_, &PropertyPanel::modelEdited, this, &MainWindow::onModelEdited);
+  connect(prop_, &PropertyPanel::editRejected, this,
+          [this](const QString& why) { log(why, true); });
 
   log(QStringLiteral("就绪。打开一个 .yjk 建模脚本，或直接点「开始计算」用内置示例试跑。"));
   setBusy(false);
@@ -449,7 +457,7 @@ void MainWindow::publishModel() {
   }
 }
 
-void MainWindow::publishResults() {
+void MainWindow::publishResults(bool autostyle) {
   view_->setResult(result_.get());
   view_->setPost(post_.get());
   prop_->setResult(result_.get());
@@ -461,7 +469,10 @@ void MainWindow::publishResults() {
 
   // 自动切到"变形 + 位移云图"：
   // 算完之后用户的第一件事就是看变形，让他们再点四下菜单是浪费。
-  if (result_ && result_->ok) {
+  // 【autostyle=false 用于属性编辑触发的内存重算】编辑过程中用户视角
+  // 正盯着某一根梁，此时自动切云图 + frameAll 会把视口拽走，
+  // 打断"改一处 → 看一处"的工作流。
+  if (autostyle && result_ && result_->ok) {
     actDeform_->setChecked(true);
     actContour_->setChecked(true);
     if (cmbField_->count() > 0) cmbField_->setCurrentIndex(0);
@@ -742,6 +753,109 @@ void MainWindow::onRun() {
             .arg(fmtNum(b->solveMs, 3)));
     log(QStringLiteral("    ") + QString::fromStdString(post_->summary()));
     statusBar()->showMessage(QStringLiteral("计算完成"), 4000);
+  });
+
+th->start();
+}
+
+// -----------------------------------------------------------------------------
+//  T3：属性面板编辑后
+// -----------------------------------------------------------------------------
+void MainWindow::onModelEdited() {
+  if (!model_) return;
+
+  // 铁律③：模型变了，结果必须失效 —— 用户绝不能看着旧云图做新决策
+  const bool hadResult = (result_ != nullptr);
+  clearResults();
+
+  // 刷新渲染与模型树（血缘关系：编辑的是同一个 model_ 对象，
+  // 不能走 setModel —— 它会清空视口的结果/选中态，见 View3D 注释）
+  view_->refresh();
+  tree_->setModel(model_.get());
+
+  // 恢复选中：刷新树后选中态丢失，把刚才编辑的对象重新高亮
+  // 【不能用 view_->selectElement(-1, 0)】那会触发"空选中 →
+  // 面板 clear"的联动链，把属性面板的当前对象清掉，下一次编辑就断了。
+  if (prop_->currentElem() >= 0) {
+    view_->selectElement(prop_->currentElem(), prop_->currentType());
+    tree_->selectElement(prop_->currentElem(), prop_->currentType());
+  }
+  // 节点场景：视口选中态在 refresh() 后依然保留，无需干预；
+  // 树没有节点级高亮接口，保持原样即可。
+
+  // 上次重算还没结束（例如编辑器销毁时又提交了一次修改）：
+  // 记一笔，等当前重算结束用最新模型补跑，别把这次编辑吞掉。
+  if (busy_) {
+    pendingRecompute_ = true;
+    return;
+  }
+
+  // 之前有结果 → 用内存模型重算（onRun 会从磁盘重解析，把编辑丢掉）
+  if (hadResult) recomputeFromMemory();
+}
+
+void MainWindow::recomputeFromMemory() {
+  if (!model_ || busy_) return;
+
+  // UI 线程做深拷贝快照：后台线程 assignDofs/solve 会写 nodes_[].dof[]，
+  // 与 UI 线程并发读写同一个 Model 是数据竞争（Model.h 有专门注释）。
+  // clone 保持节点/单元顺序，故求解结果的 u 索引与主线程 model_ 对齐。
+  auto b = std::make_shared<Bundle>();
+  b->model = std::make_unique<Model>(model_->clone());
+  setBusy(true, QStringLiteral("属性已修改，重算中…"));
+  prop_->setEditEnabled(false);
+
+  QThread* th = QThread::create([b]() {
+    b->model->assignDofs();
+    const Model::Diagnostic d = b->model->check();
+    b->checkOk = d.ok();
+    for (const auto& e : d.errors) b->diagErrors += e + "\n";
+    for (const auto& w : d.warnings) b->diagWarnings += w + "\n";
+    if (!b->checkOk) return;
+
+    StaticAnalysis sa(*b->model);
+    auto sr = std::make_unique<StaticResult>(sa.solve());
+    b->solveMessage = sr->message;
+    b->solveOk = sr->ok;
+    b->result = std::move(sr);
+  });
+
+  connect(th, &QThread::finished, this, [this, b, th]() {
+    th->deleteLater();
+    setBusy(false);
+    prop_->setEditEnabled(true);
+
+    if (!b->checkOk || !b->solveOk) {
+      log(QStringLiteral("重算未通过（结果保持失效，模型仍生效）："), true);
+      if (!b->diagErrors.empty()) log(QString::fromStdString(b->diagErrors).trimmed(), true);
+      if (!b->solveMessage.empty())
+        log(QString::fromStdString(b->solveMessage), true);
+      QMessageBox::warning(this, QStringLiteral("重算未通过"),
+                           b->checkOk ? QString::fromStdString(b->solveMessage)
+                                      : QStringLiteral("模型校核未通过，结果已失效：\n\n") +
+                                            QString::fromStdString(b->diagErrors));
+    } else {
+      // 注意：PostProcessor 持有 Model 的【引用】，
+      // 不能引用后台线程里的快照（快照随 b 析构后悬垂）。
+      // 主线程 model_ 此刻与快照内容一致（clone + 顺序保持），
+      // 用它重建 post 即可安全存活。
+      result_ = std::move(b->result);
+      post_ = std::make_unique<post::PostProcessor>(*model_, *result_);
+      post_->compute(21, 0.7);
+      tree_->setPost(post_.get());
+      publishResults(false);      // 不自动切视角/云图，别打断编辑工作流
+
+      log(QStringLiteral("重算完成：自由度 %1，残差 %2（属性编辑后自动重算）")
+              .arg(result_->ndof)
+              .arg(fmtNum(result_->residual, 2)));
+      statusBar()->showMessage(QStringLiteral("已重算"), 3000);
+    }
+
+    // 重算进行中又被编辑过 → 用最新模型补跑一次（见 onModelEdited）
+    if (pendingRecompute_) {
+      pendingRecompute_ = false;
+      recomputeFromMemory();
+    }
   });
 
   th->start();
