@@ -207,7 +207,8 @@ bool ModelScript::parse(const std::string& text) {
     // cmds_，build() 遍历 cmds_ 时 currentCase_ 保持 parse 结束时的值，
     // 若在 build 阶段分组会把所有荷载误归到最后声明的工况。
     if (sawCaseCmd_ && (c.name == "selfweight" || c.name == "slabload" ||
-                        c.name == "beamload" || c.name == "nodeload")) {
+                        c.name == "beamload" || c.name == "nodeload" ||
+                        c.name == "nodemoment")) {
       caseLoads_[currentCase_].push_back(c);
       continue;
     }
@@ -325,6 +326,35 @@ bool ModelScript::build(Model& m, std::string* info) {
     if (c.name == "material") {
       if (!need(c, 3)) continue;
       const std::string kind = lower(a[1]);
+      if (kind == "raw") {
+        // material <名> raw <E> <nu> <gamma> <fy> <ft> <fc> <G>
+        // 原始材料：任意字段直接给；G ≤ 0 表示由 E、ν 自动算（与
+        // Material 默认一致）。交互层写入的任意材料都走这条命令。
+        if (!need(c, 9)) continue;
+        double E = 0, nu = 0, gamma = 0, fy = 0, ft = 0, fc = 0, G = 0;
+        bool ok = true;
+        const char* names[7] = {"E", "ν", "γ", "fy", "ft", "fc", "G"};
+        double* dst[7] = {&E, &nu, &gamma, &fy, &ft, &fc, &G};
+        for (int i = 0; i < 7; ++i) {
+          if (!toNum(a[static_cast<size_t>(i + 2)], *dst[i])) {
+            errors_.push_back("第 " + std::to_string(c.line) + " 行：材料参数 " +
+                              names[i] + " '" + a[static_cast<size_t>(i + 2)] +
+                              "' 不是合法数值");
+            ok = false;
+          }
+        }
+        if (!ok) continue;
+        if (!(E > 0.0) || !(nu >= 0.0 && nu < 0.5) || !(gamma >= 0.0)) {
+          errors_.push_back("第 " + std::to_string(c.line) +
+                            " 行：材料参数不合法（需 E>0，0≤ν<0.5，γ≥0）");
+          continue;
+        }
+        Material rawMat;
+        rawMat.E = E; rawMat.nu = nu; rawMat.gamma = gamma;
+        rawMat.fy = fy; rawMat.ft = ft; rawMat.fc = fc; rawMat.G = G;
+        mats[a[0]] = rawMat;
+        continue;
+      }
       int grade = 0;
       if (!toInt(a[2], grade)) {
         errors_.push_back("第 " + std::to_string(c.line) + " 行：牌号 '" + a[2] + "' 不是整数");
@@ -333,7 +363,7 @@ bool ModelScript::build(Model& m, std::string* info) {
       if (kind == "concrete" || kind == "c") mats[a[0]] = Material::concreteC(grade);
       else if (kind == "steel" || kind == "q" || kind == "s") mats[a[0]] = Material::steelQ(grade);
       else errors_.push_back("第 " + std::to_string(c.line) + " 行：材料类型 '" + a[1] +
-                             "' 未知（应为 concrete / steel）");
+                             "' 未知（应为 concrete / steel / raw）");
       continue;
     }
 
@@ -359,9 +389,189 @@ bool ModelScript::build(Model& m, std::string* info) {
       else if (kind == "tube" && p.size() == 2) secs[a[0]] = section::tube(p[0], p[1]);
       else if (kind == "i" && p.size() == 4) secs[a[0]] = section::iSection(p[0], p[1], p[2], p[3]);
       else if (kind == "box" && p.size() == 4) secs[a[0]] = section::boxSection(p[0], p[1], p[2], p[3]);
+      else if (kind == "raw" && p.size() == 10) {
+        // section <名> raw <A> <Iy> <Iz> <J> <Asy> <Asz> <Ry> <Rz> <hy> <hz>
+        // 原始截面：任意几何直接给（交互层读取-修改-写回任意截面都用这条）。
+        SectionProperties s;
+        s.A = p[0]; s.Iy = p[1]; s.Iz = p[2]; s.J = p[3];
+        s.Asy = p[4]; s.Asz = p[5]; s.Ry = p[6]; s.Rz = p[7];
+        s.hy = p[8]; s.hz = p[9];
+        std::string why;
+        if (!s.isValid(&why)) errors_.push_back("第 " + std::to_string(c.line) +
+                                                " 行：截面 '" + a[0] + "' 无效：" + why);
+        else secs[a[0]] = s;
+      }
       else errors_.push_back("第 " + std::to_string(c.line) + " 行：截面 '" + a[0] + "' 的型式 '" +
                              a[1] + "' 与参数个数（" + std::to_string(p.size()) +
-                             "）不匹配（rect 2 / circle 1 / tube 2 / i 4 / box 4）");
+                             "）不匹配（rect 2 / circle 1 / tube 2 / i 4 / box 4 / raw 10）");
+      continue;
+    }
+
+    // ---------------- 原始构件（P3：交互层与脚本层共用同一套内核接口） ----------------
+    // 不经轴网，直接从显式节点/单元建模型。node 必须先行声明（按出现顺序
+    // 分配 id=0,1,2,…），beam/column/shell/wall/fix/nodeweight 引用这些 id。
+    // YjkWriter 序列化的脚本（另存为 .yjk）就只包含这一组命令，不写轴网。
+    if (c.name == "node") {
+      if (!need(c, 3)) continue;
+      double x = 0, y = 0, z = 0;
+      int story = 0;
+      if (!toNum(a[0], x) || !toNum(a[1], y) || !toNum(a[2], z)) {
+        errors_.push_back("第 " + std::to_string(c.line) +
+                          " 行：node 坐标不是三个合法数值");
+        continue;
+      }
+      if (a.size() >= 4 && !toInt(a[3], story)) {
+        errors_.push_back("第 " + std::to_string(c.line) + " 行：层号 '" + a[3] +
+                          "' 不是整数");
+        continue;
+      }
+      m.addNode(Vec3{x, y, z}, story);
+      continue;
+    }
+    if (c.name == "beam" || c.name == "column") {
+      // beam <i> <j> <截面> <材料> [upx upy upz]
+      // column 与 beam 同构：柱 = 竖向梁，只是无 up 时默认 {0,-1,0}。
+      if (!need(c, 4)) continue;
+      Id i = 0, j = 0;
+      int ni = 0, nj = 0;
+      const bool okI = toInt(a[0], ni) && ni >= 0;
+      const bool okJ = toInt(a[1], nj) && nj >= 0;
+      if (!okI || !okJ) {
+        errors_.push_back("第 " + std::to_string(c.line) +
+                          " 行：单元端点号必须是 ≥0 的整数");
+        continue;
+      }
+      if (ni >= m.nodeCount() || nj >= m.nodeCount()) {
+        errors_.push_back("第 " + std::to_string(c.line) + " 行：单元端点号 (" +
+                          std::to_string(ni) + "," + std::to_string(nj) +
+                          ") 越界（当前节点 0.." + std::to_string(m.nodeCount() - 1) + "）");
+        continue;
+      }
+      i = static_cast<Id>(ni); j = static_cast<Id>(nj);
+      SectionProperties sec;
+      Material mat;
+      if (!findSec(a[2], sec, c.line) || !findMat(a[3], mat, c.line)) continue;
+      Vec3 up = (c.name == "column") ? Vec3{0, -1, 0} : Vec3{0, 0, -1};
+      if (a.size() >= 7) {
+        double ux = 0, uy = 0, uz = 0;
+        if (!toNum(a[4], ux) || !toNum(a[5], uy) || !toNum(a[6], uz)) {
+          errors_.push_back("第 " + std::to_string(c.line) +
+                            " 行：up 向量不是三个合法数值");
+          continue;
+        }
+        up = Vec3{ux, uy, uz};
+      }
+      BeamElement* b = (c.name == "column")
+                           ? m.addColumn(i, j, sec, mat, up)
+                           : m.addBeam(i, j, sec, mat, up);
+      if (!b) {
+        errors_.push_back("第 " + std::to_string(c.line) + " 行：" + c.name +
+                          " 创建失败（端点越界或长度为零）");
+        continue;
+      }
+      continue;
+    }
+    if (c.name == "shell" || c.name == "wall") {
+      // shell <a> <b> <c> <d> <厚> [E nu density]   墙 = shell + isWall
+      if (!need(c, 5)) continue;
+      std::vector<Id> ns;
+      bool nodeOk = true;
+      for (size_t k = 0; k < 4; ++k) {
+        int v = 0;
+        if (!toInt(a[k], v) || v < 0 || v >= m.nodeCount()) {
+          errors_.push_back("第 " + std::to_string(c.line) + " 行：节点号 '" + a[k] +
+                            "' 越界（当前节点 0.." + std::to_string(m.nodeCount() - 1) + "）");
+          nodeOk = false;
+          break;
+        }
+        ns.push_back(static_cast<Id>(v));
+      }
+      if (!nodeOk) continue;
+      double t = 0;
+      if (!toNum(a[4], t) || !(t > 0.0)) {
+        errors_.push_back("第 " + std::to_string(c.line) + " 行：厚度必须为正数");
+        continue;
+      }
+      ShellProperties props;
+      props.thickness = t;
+      if (a.size() >= 6) {
+        double E = 0;
+        if (!toNum(a[5], E) || !(E > 0.0)) {
+          errors_.push_back("第 " + std::to_string(c.line) + " 行：E 必须为正数");
+          continue;
+        }
+        props.E = E;
+      }
+      if (a.size() >= 7) {
+        double nu = 0;
+        if (!toNum(a[6], nu) || !(nu >= 0.0 && nu < 0.5)) {
+          errors_.push_back("第 " + std::to_string(c.line) + " 行：ν 必须在 [0,0.5)");
+          continue;
+        }
+        props.nu = nu;
+      }
+      if (a.size() >= 8) {
+        double d = 0;
+        if (!toNum(a[7], d) || !(d > 0.0)) {
+          errors_.push_back("第 " + std::to_string(c.line) + " 行：density 必须为正数");
+          continue;
+        }
+        props.density = d;
+      }
+      if (c.name == "wall") m.addWall(ns, props);
+      else m.addShell(ns, props);
+      continue;
+    }
+    if (c.name == "fix") {
+      // fix node <id> <ux> <uy> <uz> <rx> <ry> <rz>（0/1，任意组合约束）
+      if (!need(c, 8)) continue;
+      if (lower(a[0]) != "node") {
+        errors_.push_back("第 " + std::to_string(c.line) +
+                          " 行：fix 的目标只能是 node（当前只支持显式节点）");
+        continue;
+      }
+      int id = 0;
+      if (!toInt(a[1], id) || id < 0 || id >= m.nodeCount()) {
+        errors_.push_back("第 " + std::to_string(c.line) + " 行：节点号 " + a[1] +
+                          " 越界（有效范围 0.." + std::to_string(m.nodeCount() - 1) + "）");
+        continue;
+      }
+      std::array<bool, 6> fx{};
+      bool ok = true;
+      for (int k = 0; k < 6; ++k) {
+        const std::string s = lower(a[static_cast<size_t>(k + 2)]);
+        if (s == "1" || s == "on" || s == "true") fx[static_cast<size_t>(k)] = true;
+        else if (s == "0" || s == "off" || s == "false") fx[static_cast<size_t>(k)] = false;
+        else {
+          errors_.push_back("第 " + std::to_string(c.line) + " 行：约束分量 '" +
+                            a[static_cast<size_t>(k + 2)] + "' 应为 0/1");
+          ok = false;
+        }
+      }
+      if (!ok) continue;
+      m.fixNode(static_cast<Id>(id), fx[0], fx[1], fx[2], fx[3], fx[4], fx[5]);
+      continue;
+    }
+    if (c.name == "nodeweight") {
+      // nodeweight node <id> <w> —— 节点附加重量（建模属性，不分工况）
+      if (!need(c, 3)) continue;
+      if (lower(a[0]) != "node") {
+        errors_.push_back("第 " + std::to_string(c.line) +
+                          " 行：nodeweight 的目标只能是 node");
+        continue;
+      }
+      int id = 0;
+      if (!toInt(a[1], id) || id < 0 || id >= m.nodeCount()) {
+        errors_.push_back("第 " + std::to_string(c.line) + " 行：节点号 " + a[1] +
+                          " 越界（有效范围 0.." + std::to_string(m.nodeCount() - 1) + "）");
+        continue;
+      }
+      double w = 0;
+      if (!toNum(a[2], w) || !(w > 0.0)) {
+        errors_.push_back("第 " + std::to_string(c.line) + " 行：重量必须为正数");
+        continue;
+      }
+      m.addNodeWeight(static_cast<Id>(id), w);
       continue;
     }
 
@@ -776,7 +986,8 @@ bool ModelScript::build(Model& m, std::string* info) {
 
     // ---------------- 荷载 ----------------
     if (c.name == "selfweight" || c.name == "slabload" ||
-        c.name == "beamload" || c.name == "nodeload") {
+        c.name == "beamload" || c.name == "nodeload" ||
+        c.name == "nodemoment") {
       if (sawCaseCmd_) {
         // 多工况模式：荷载不在此处施加，按工况分组，等 applyCase() 重放
         caseLoads_[currentCase_].push_back(c);
@@ -970,6 +1181,61 @@ bool ModelScript::applyLoadCmd(Model& m, const Command& c, std::string* info) {
                                         " 行：顶层没有节点");
     } else {
       errors_.push_back("第 " + std::to_string(c.line) + " 行：nodeload 目标 '" + a[0] +
+                        "' 未知（node / story / top）");
+    }
+    return true;
+  }
+
+  if (c.name == "nodemoment") {
+    // nodemoment <目标> <目标号> <mx> <my> <mz>；top 没有目标号。
+    // 与 nodeload 同构（P3：节点力矩荷载，施加到节点力矩）。
+    if (a.size() < 3) { errors_.push_back("第 " + std::to_string(c.line) +
+                       " 行：nodemoment 需要 3 个力矩分量"); return true; }
+    Vec3 g{0, 0, 0};
+    const size_t base = (lower(a[0]) == "top") ? 1u : 2u;
+    if (a.size() < base + 3) {
+      errors_.push_back("第 " + std::to_string(c.line) + " 行：nodemoment 需要 3 个力矩分量");
+      return true;
+    }
+    bool ok = true;
+    for (int k = 0; k < 3; ++k)
+      if (!toNum(a[base + static_cast<size_t>(k)], g[k])) {
+        errors_.push_back("第 " + std::to_string(c.line) + " 行：力矩分量 '" +
+                          a[base + static_cast<size_t>(k)] + "' 不是合法数值");
+        ok = false;
+      }
+    if (!ok) return true;
+    const std::string tgt = lower(a[0]);
+    if (tgt == "node") {
+      int id = 0;
+      if (!toInt(a[1], id) || id < 0 || id >= m.nodeCount()) {
+        errors_.push_back("第 " + std::to_string(c.line) + " 行：节点号越界");
+        return true;
+      }
+      m.addNodeMoment(static_cast<Id>(id), g);
+    } else if (tgt == "story") {
+      int s = 0;
+      if (!toInt(a[1], s)) { errors_.push_back("第 " + std::to_string(c.line) +
+                             " 行：层号不是整数"); return true; }
+      int cnt = 0;
+      for (Id i = 0; i < m.nodeCount(); ++i) {
+        if (m.node(i).diaphragmMaster) continue;
+        if (m.node(i).story == s) { m.addNodeMoment(i, g); ++cnt; }
+      }
+      if (cnt == 0) warnings_.push_back("第 " + std::to_string(c.line) + " 行：第 " +
+                                        std::to_string(s) + " 层没有节点");
+    } else if (tgt == "top") {
+      int top = -1;
+      for (Id i = 0; i < m.nodeCount(); ++i) top = std::max(top, m.node(i).story);
+      int cnt = 0;
+      for (Id i = 0; i < m.nodeCount(); ++i) {
+        if (m.node(i).diaphragmMaster) continue;
+        if (m.node(i).story == top) { m.addNodeMoment(i, g); ++cnt; }
+      }
+      if (cnt == 0) warnings_.push_back("第 " + std::to_string(c.line) +
+                                        " 行：顶层没有节点");
+    } else {
+      errors_.push_back("第 " + std::to_string(c.line) + " 行：nodemoment 目标 '" + a[0] +
                         "' 未知（node / story / top）");
     }
     return true;

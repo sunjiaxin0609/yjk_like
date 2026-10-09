@@ -16,11 +16,26 @@
 //    # 注释（行内任意位置起）
 //    material   <名>  concrete <牌号>          C30→concrete 30
 //    material   <名>  steel    <牌号>
+//    material   <名>  raw   <E> <nu> <gamma> <fy> <ft> <fc> <G>
+//                                    原始材料（任意字段；G≤0 自动按 E,ν 算）
 //    section    <名>  rect   <b> <h>
 //    section    <名>  circle <d>
 //    section    <名>  tube   <d> <t>
 //    section    <名>  i      <h> <b> <tw> <tf>
 //    section    <名>  box    <h> <b> <tw> <tf>
+//    section    <名>  raw  <A> <Iy> <Iz> <J> <Asy> <Asz> <Ry> <Rz> <hy> <hz>
+//
+//  —— 原始构件命令（P3 交互建模：脚本层与交互层共用同一套内核接口）——
+//  直接从显式节点/单元建模型，不经轴网。节点必须先行声明，
+//  node 命令按出现顺序分配 id = 0,1,2,…；单元命令引用这些 id。
+//    node       <x> <y> <z> <story=0>          添加节点
+//    beam       <i> <j> <截面> <材料> [upx upy upz]
+//    column     <i> <j> <截面> <材料> [upx upy upz]   柱 = 竖向梁（等价 beam）
+//    shell      <a> <b> <c> <d> <厚> [E nu density]
+//    wall       <a> <b> <c> <d> <厚> [E nu density]   墙 = 壳 + isWall
+//    fix node   <id> <ux> <uy> <uz> <rx> <ry> <rz>   任意自由度组合约束
+//    nodeweight node <id> <w>                   节点附加重量（建模属性，
+//                                                 not 工况荷载，不分 case）
 //
 //    grid.axisX   <y...>                    X 向轴线的 y 坐标
 //    grid.axisY   <x...>                    Y 向轴线的 x 坐标
@@ -46,6 +61,9 @@
 //    nodeload   node  <id>    <fx> <fy> <fz>
 //    nodeload   story <层>    <fx> <fy> <fz>
 //    nodeload   top           <fx> <fy> <fz>
+//    nodemoment node  <id>    <mx> <my> <mz>      节点力矩荷载（工况荷载）
+//    nodemoment story <层>    <mx> <my> <mz>
+//    nodemoment top           <mx> <my> <mz>
 //
 //    case <工况名>                   切换荷载工况（缺省工况 "D"）
 //    modal [nmodes]                  请求模态分析（缺省/auto/0 = 自动取值

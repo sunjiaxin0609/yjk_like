@@ -653,9 +653,46 @@ class Model {
   SpringElement* addSpring(Id nI, Id nJ, const std::array<double, 6>& k,
                            const Vec3& up = Vec3{0, 0, -1});
 
-  std::vector<std::unique_ptr<Element>>& elements() { return elems_; }
+std::vector<std::unique_ptr<Element>>& elements() { return elems_; }
   const std::vector<std::unique_ptr<Element>>& elements() const { return elems_; }
   Id elementCount() const { return static_cast<Id>(elems_.size()); }
+
+  // 按 id 索引查询单元（id = 该单元在 elements() 中的序号）。
+  // 等价于 elements()[idx]，但交互层（拾取/属性面板）需要
+  // 一个"按 id 访问"的稳定入口 —— 元素创建顺序 = id 分配顺序。
+  Element* element(Id idx) { return elems_[static_cast<size_t>(idx)].get(); }
+  const Element* element(Id idx) const {
+    return elems_[static_cast<size_t>(idx)].get();
+  }
+
+  // ---- P3 交互建模：可变接口（脚本层与交互层共用）----
+
+  // 柱 = 竖向梁。与 addBeam 的唯一区别是默认 up（局部 y 参考方向）取
+  // 水平方向 {0, -1, 0}，避免与竖直柱轴共线导致 up 回退（BeamElement
+  // 的 up 与梁轴平行时会自动切备用方向，柱轴竖直时 {0,0,-1} 恰好共线）。
+  BeamElement* addColumn(Id nI, Id nJ, const SectionProperties& sec,
+                         const Material& mat,
+                         const Vec3& up = Vec3{0, -1, 0});
+
+  // 墙 = 壳单元 + isWall 标志（自重进楼层剪力、参与墙底反力对账）。
+  ShellElement* addWall(const std::vector<Id>& ns, const ShellProperties& props);
+
+  // 节点荷载（力 + 力矩）一次性施加；M 缺省为零。
+  void addNodeLoad(Id n, const Vec3& F, const Vec3& M = Vec3{0, 0, 0});
+
+  // 删除第 idx 个单元。后续单元的序号整体前移 —— 交互层删除后
+  // 必须刷新选中态（T5 命令模式用"重建选中态"恢复，不依赖旧 id）。
+  // 返回是否删除成功（idx 越界返回 false）。
+  bool removeElement(Id idx);
+
+  // 删除节点：仅当该节点【未被任何单元引用】且【不是刚性楼板主节点】
+  // 时才有效 —— 内部走 retired 标记（见 Node::retired 注释：
+  // 结果向量按节点序×6 索引，不能物理删除）。被引用时返回 false，
+  // 调用方应先删除相关单元。
+  bool removeNode(Id n);
+
+  // 清空整个模型：节点、单元、刚性楼板、自由度编号全部重置。
+  void clear();
 
 // ---- 荷载 ----
   void addNodeForce(Id n, const Vec3& F) { nodes_[n].force = nodes_[n].force + F; }

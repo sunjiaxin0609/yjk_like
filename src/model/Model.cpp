@@ -99,6 +99,55 @@ ShellElement* Model::addShell(const std::vector<Id>& ns, const ShellProperties& 
 }
 
 // -----------------------------------------------------------------------------
+//  P3 交互建模：可变接口（脚本层与交互层共用）
+// -----------------------------------------------------------------------------
+BeamElement* Model::addColumn(Id nI, Id nJ, const SectionProperties& sec,
+                              const Material& mat, const Vec3& up) {
+  // 柱 = 竖向梁。addBeam 已校验节点范围/零长度并初始化几何，
+  // 这里只需按柱的语义传 up（默认水平方向，见 Model.h 注释）。
+  return addBeam(nI, nJ, sec, mat, up);
+}
+
+ShellElement* Model::addWall(const std::vector<Id>& ns, const ShellProperties& props) {
+  ShellElement* s = addShell(ns, props);
+  if (s) s->setWall(true);               // 墙标志：自重进楼层剪力
+  return s;
+}
+
+void Model::addNodeLoad(Id n, const Vec3& F, const Vec3& M) {
+  if (n < 0 || n >= nodeCount()) return;
+  addNodeForce(n, F);
+  addNodeMoment(n, M);
+}
+
+bool Model::removeElement(Id idx) {
+  if (idx < 0 || idx >= elementCount()) return false;
+  elems_.erase(elems_.begin() + static_cast<ptrdiff_t>(idx));
+  return true;
+}
+
+bool Model::removeNode(Id n) {
+  if (n < 0 || n >= nodeCount()) return false;
+  const Node& nd = nodes_[static_cast<size_t>(n)];
+  if (nd.retired) return false;                          // 已删除
+  if (nd.diaphragmMaster) return false;                  // 楼板主节点不能删
+  for (const auto& e : elems_) {                         // 引用则拒绝
+    const auto& ns = e->nodes();
+    if (std::find(ns.begin(), ns.end(), n) != ns.end()) return false;
+  }
+  nodes_[static_cast<size_t>(n)].retired = true;
+  return true;
+}
+
+void Model::clear() {
+  nodes_.clear();
+  elems_.clear();
+  links_.clear();
+  diaphragms_.clear();
+  numbering_ = DofNumbering();       // 重置编号策略为默认（StoryDescending）
+}
+
+// -----------------------------------------------------------------------------
 //  刚性楼板（多点约束）
 // -----------------------------------------------------------------------------
 //
