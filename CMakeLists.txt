@@ -55,7 +55,9 @@ src/analysis/StaticAnalysis.cpp
   src/analysis/LoadCombination.cpp
   src/post/PostProcessor.cpp
   src/post/ResultExport.cpp
-  src/io/ModelScript.cpp
+src/io/ModelScript.cpp
+  src/io/YjkWriter.cpp
+  src/interact/PickCore.cpp
 )
 
 add_library(yjk_core STATIC ${YJK_CORE_SOURCES})
@@ -185,6 +187,20 @@ if(YJK_BUILD_TESTS)
   target_link_libraries(test_wall PRIVATE yjk_core)
   add_test(NAME wall COMMAND test_wall
            ${CMAKE_CURRENT_SOURCE_DIR}/examples/frame_wall.yjk)
+
+  # P3 交互建模 T1：内核可变接口（addColumn/addWall/addNodeLoad/remove/clear
+  #   与按 id 索引查询）—— 脚本层与交互层共用同一套接口。
+  #   核心验收：Model 建模型 → YjkWriter 序列化 → ModelScript 读回，
+  #   节点/单元/荷载集合逐字段一致。
+  add_executable(test_interact tests/test_interact.cpp)
+  target_link_libraries(test_interact PRIVATE yjk_core)
+  add_test(NAME interact COMMAND test_interact)
+
+  # P3-T2 射线拾取核心：yjk::interact 纯函数（无 Qt 依赖），
+  # View3D 与脚本层共用同一套命中逻辑，单测覆盖节点/梁/壳/遮挡/tMax。
+  add_executable(test_pick tests/test_pick.cpp)
+  target_link_libraries(test_pick PRIVATE yjk_core)
+  add_test(NAME pick COMMAND test_pick)
 endif()
 
 # ============================================================

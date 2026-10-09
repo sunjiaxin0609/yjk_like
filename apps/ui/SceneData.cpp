@@ -337,8 +337,16 @@ Scene SceneBuilder::build(const RenderOptions& opt) const {
     }
   }
 
-  if (opt.showGrid) addGrid(opt, s);
+if (opt.showGrid) addGrid(opt, s);
   if (opt.showSupports) addSupports(opt, scale, s);
+
+  // 拾取节点无条件填充：射线拾取必须与"是否显示节点"解耦，
+  // 否则用户关掉节点显示后就点不中节点，行为会很怪异。
+  for (const Node& nd : m_.nodes()) {
+    if (nd.retired) continue;
+    s.pickNodes.push_back({static_cast<int>(nd.id), nodePos(nd.id, scale)});
+  }
+
   if (opt.showNodes) addNodes(opt, scale, s);
 
   if (!s.boundsValid) { s.lo = QVector3D(0, 0, 0); s.hi = QVector3D(1, 1, 1); }
@@ -349,17 +357,19 @@ Scene SceneBuilder::build(const RenderOptions& opt) const {
 //  节点
 // -----------------------------------------------------------------------------
 void SceneBuilder::addNodes(const RenderOptions& opt, double scale, Scene& s) const {
-  const double sz = std::max(3.0, (s.hi - s.lo).length() * 0.5);
   for (const Node& nd : m_.nodes()) {
     if (nd.retired) continue;
-    const bool hovered = (opt.hoverType == 3 && opt.hoverElem == static_cast<int>(nd.id));
+    const int id = static_cast<int>(nd.id);
+    const bool hovered = (opt.hoverType == 3 && opt.hoverElem == id);
+    const bool picked = std::find(opt.selectedNodes.begin(), opt.selectedNodes.end(), id) !=
+                        opt.selectedNodes.end();
+    // 交互色优先级：悬停 > 选中 > 常态
     Point p;
     p.p = nodePos(nd.id, scale);
-    p.color = hovered ? Member::hover() : Member::node();
-    p.size = hovered ? 7.0 : 4.5;
-    p.node = static_cast<int>(nd.id);
+    p.color = hovered ? Member::hover() : (picked ? Member::selected() : Member::node());
+    p.size = hovered ? 8.0 : (picked ? 6.5 : 4.5);
+    p.node = id;
     s.points.push_back(p);
-    (void)sz;
   }
 }
 

@@ -81,10 +81,11 @@ struct RenderOptions {
   double deformScale{0.0};     // 0 由 autoScale 自动定
   bool autoScale{true};
 
-  // 高亮
+// 高亮
   int hoverElem{-1};
-  int hoverType{0};            // 0 无 1 梁 2 壳
+  int hoverType{0};            // 0 无 1 梁 2 壳 3 节点
   std::vector<int> selected;   // 选中的单元索引
+  std::vector<int> selectedNodes;  // 选中的节点 id（独立于单元选择）
   int selectedType{0};
   int extremeElem{-1};         // 包络极值所在构件（用醒目色）
   int extremeType{0};
@@ -149,13 +150,21 @@ struct Scene {
   double appliedScale{1.0};
   double maxDisp{0.0};
 
-  // 拾取用的构件中心线（世界坐标，含变形）。
+// 拾取用的构件中心线（世界坐标，含变形）。
   // 壳单元直接按投影后的四边形做点包含判断，不需要额外存。
   struct PickBeam {
     int elem{-1};
     QVector3D a, b;
   };
   std::vector<PickBeam> pickBeams;
+
+  // 射线拾取用的节点（世界坐标，含变形）。
+  // 与 pickBeams 一样无条件填充：拾取必须不依赖 showNodes 是否勾选。
+  struct PickNode {
+    int id{-1};
+    QVector3D p;
+  };
+  std::vector<PickNode> pickNodes;
 
   bool hasContour() const { return !valueLabel.empty(); }
 

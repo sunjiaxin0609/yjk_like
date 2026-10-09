@@ -132,8 +132,9 @@ class View3D : public QWidget {
   bool rotating_{false};
   bool panning_{false};
 
-  std::vector<int> sel_;
+std::vector<int> sel_;
   int selType_{0};
+  int selNode_{-1};   // 选中的节点 id（-1 = 未选中节点）
 
   bool animating_{false};
   double animPhase_{M_PI};

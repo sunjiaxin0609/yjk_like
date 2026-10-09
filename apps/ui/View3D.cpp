@@ -27,6 +27,7 @@
 
 #include "ColorMap.h"
 #include "Theme.h"
+#include "yjk/interact/PickCore.h"
 
 namespace ui {
 
@@ -55,24 +56,12 @@ QColor shadeColor(const QColor& base, const QVector3D& n) {
                 base.alpha());
 }
 
-double distToSegment(const QPointF& p, const QPointF& a, const QPointF& b) {
-  const double vx = b.x() - a.x(), vy = b.y() - a.y();
-  const double wx = p.x() - a.x(), wy = p.y() - a.y();
-  const double len2 = vx * vx + vy * vy;
-  double t = (len2 > 1e-12) ? (wx * vx + wy * vy) / len2 : 0.0;
-  t = std::clamp(t, 0.0, 1.0);
-  const double dx = wx - t * vx, dy = wy - t * vy;
-  return std::sqrt(dx * dx + dy * dy);
-}
-
-bool pointInPoly(const QPointF& p, const QPointF* q, int n) {
-  bool in = false;
-  for (int i = 0, j = n - 1; i < n; j = i++) {
-    if (((q[i].y() > p.y()) != (q[j].y() > p.y())) &&
-        (p.x() < (q[j].x() - q[i].x()) * (p.y() - q[i].y()) / (q[j].y() - q[i].y()) + q[i].x()))
-      in = !in;
-  }
-  return in;
+// 像素容差(px) → 世界容差(m)。与拾取共用：视口中心向上 1 px 的
+// 世界位移即"每像素对应多少米"，对透视/正交投影都正确。
+double worldPerPixAt(const Camera& cam, const QRect& vp) {
+  const QVector3D c0 = cam.unproject(0, 0, vp);
+  const QVector3D c1 = cam.unproject(0, 1, vp);
+  return std::max(static_cast<double>((c1 - c0).length()), 1e-6);
 }
 
 struct DrawItem {
@@ -169,6 +158,8 @@ void View3D::clearSelection() {
   sel_.clear();
   selType_ = 0;
   opt_.selected.clear();
+  selNode_ = -1;
+  opt_.selectedNodes.clear();
   dirty_ = true;
   update();
   emit selectionChanged();
@@ -178,6 +169,8 @@ void View3D::selectElement(int elem, int type) {
   sel_.clear();
   opt_.selected.clear();
   selType_ = 0;
+  selNode_ = -1;
+  opt_.selectedNodes.clear();
   if (elem >= 0 && type > 0) {
     sel_.push_back(elem);
     opt_.selected.push_back(elem);
@@ -656,69 +649,65 @@ void View3D::drawHud(QPainter& p, const QRect& vp) {
 // =============================================================================
 //  拾取
 //
-//  【阈值必须随缩放变化】固定 6 px 的容差在缩得很小的时候会把整片结构
-//  都算作"命中"，放得很大时又点不中。这里按当前视距换算一个等效像素阈值。
+//  【为什么换成射线拾取】旧实现把每条梁投影回屏幕，再用"点到线段距离"判定，
+//  对梁/壳尚可，但节点（点）在屏幕上投影后依然是点，永远点不中；
+//  而且投影判定无法正确区分前后遮挡，放大后密集区域的命中很随意。
+//  现在用世界空间射线 + yjk::interact::pickNearest 纯函数（在测试里独立验证
+//  过）：View3D 只负责"像素 → 射线"的换算，命中逻辑与脚本层共用一套。
+//
+//  【容差必须随缩放变化】固定 px 容差在缩得很小的时候会把整片结构
+//  都算作"命中"，放得很大时又点不中；按视距 + fov + 视口高换算成
+//  世界单位容差，效果等价于"屏幕上固定 6 px 的容差带"。
 // =============================================================================
 int View3D::pickAt(const QPoint& pos, int* type) const {
   *type = 0;
   if (!model_) return -1;
 
-  const QMatrix4x4& m = proj_.vp;
   const QRect vp = viewport();
-
   if (!vp.contains(pos)) return -1;
 
-  auto screenOf = [&](const QVector3D& w, QPointF* out) {
-    const QVector4D c = m * QVector4D(w, 1.0f);
-    if (c.w() <= 1e-5f) return false;
-    out->setX(vp.x() + (c.x() / c.w() * 0.5 + 0.5) * vp.width());
-    out->setY(vp.y() + (1.0 - (c.y() / c.w() * 0.5 + 0.5)) * vp.height());
-    return true;
-  };
+  // 像素 → 世界空间射线：相机眼睛是原点，指向光标反投影点。
+  const QVector3D eye = cam_.eye();
+  const QVector3D dir = cam_.unproject(pos.x(), pos.y(), vp) - eye;
+  const double tMax = cam_.radius() * 12.0 + 1.0;  // 与投影 far 平面一致
 
-  // 容差：按模型尺度换算成屏幕像素。模型越大，同样的像素容差对应越小的
-  // 相对尺寸，所以给一个下限 6 px 保证小模型也点得中。
-  const double tolPx = std::clamp(8.0, 4.0, 14.0);
+  // 屏幕容差(px) → 世界容差(m)：由 unproject 差分直接得到，
+  // 对透视/正交投影都自动正确，不需要知道 fov 的具体值。
+  const double worldPerPix = worldPerPixAt(cam_, vp);
+  const double nodeR = 6.0 * worldPerPix;
+  const double beamR = 6.0 * worldPerPix;
 
-  double best = 1e18;
-  int bestElem = -1, bestType = 0;
-
-  // 壳面：点在多边形内。深度取平均 z 用于在多个重叠面中选最近的。
+  // 组装可拾取图元（节点/梁中心线/壳四边形），都带变形。
+  std::vector<yjk::interact::PickNode> nodes;
+  nodes.reserve(scene_.pickNodes.size());
+  for (const Scene::PickNode& pn : scene_.pickNodes) {
+    nodes.push_back({static_cast<yjk::Id>(pn.id),
+                     {pn.p.x(), pn.p.y(), pn.p.z()}});
+  }
+  std::vector<yjk::interact::PickBeam> beams;
+  beams.reserve(scene_.pickBeams.size());
+  for (const Scene::PickBeam& pb : scene_.pickBeams) {
+    beams.push_back({static_cast<yjk::Id>(pb.elem),
+                     {pb.a.x(), pb.a.y(), pb.a.z()},
+                     {pb.b.x(), pb.b.y(), pb.b.z()}});
+  }
+  std::vector<yjk::interact::PickShell> shells;
   for (const Face& f : scene_.faces) {
     if (f.elemType != 2) continue;
-    QPointF q[4];
-    bool ok = true;
-    for (int i = 0; i < 4; ++i)
-      if (!screenOf(f.p[i], &q[i])) { ok = false; break; }
-    if (!ok) continue;
-    if (!pointInPoly(QPointF(pos), q, 4)) continue;
-    // 用包围盒中心深度近似
-    const QVector3D ctr = (f.p[0] + f.p[1] + f.p[2] + f.p[3]) * 0.25f;
-    const QVector4D v = cam_.view() * QVector4D(ctr, 1.0f);
-    const double d = std::abs(static_cast<double>(v.z()));
-    if (d < best) { best = d; bestElem = f.elem; bestType = 2; }
+    yjk::interact::PickShell sh;
+    sh.id = static_cast<yjk::Id>(f.elem);
+    for (int i = 0; i < 4; ++i) sh.p[i] = {f.p[i].x(), f.p[i].y(), f.p[i].z()};
+    shells.push_back(sh);
   }
 
-  // 梁：光标到中心线（或实体外沿）的屏幕距离
-  for (const Scene::PickBeam& pb : scene_.pickBeams) {
-    QPointF a, b;
-    if (!screenOf(pb.a, &a) || !screenOf(pb.b, &b)) continue;
-    const double d = distToSegment(QPointF(pos), a, b);
-    if (d > tolPx) continue;
-    // 同样距离时优先取更近的构件（屏幕上重叠的前后两根梁）
-    const QVector3D mid = (pb.a + pb.b) * 0.5f;
-    const QVector4D v = cam_.view() * QVector4D(mid, 1.0f);
-    const double depth = std::abs(static_cast<double>(v.z()));
-    // 距离为主序、深度为次序：先选"点得最准"的，再在里面选最近的
-    const double key = d * 1000.0 + depth;
-    if (key < best || bestElem < 0) {
-      if (bestType != 2) { best = key; bestElem = pb.elem; bestType = 1; }
-    }
-  }
-
-  if (bestType == 1 && bestElem < 0) return -1;
-  *type = bestType;
-  return bestElem;
+  const yjk::interact::PickHit hit = yjk::interact::pickNearest(
+      yjk::interact::Ray3({eye.x(), eye.y(), eye.z()},
+                          {dir.x(), dir.y(), dir.z()}),
+      nodes, beams, shells, nodeR, beamR, tMax);
+  if (hit.kind == yjk::interact::PickKind::None) return -1;
+  *type = (hit.kind == yjk::interact::PickKind::Node) ? 3
+        : (hit.kind == yjk::interact::PickKind::Beam) ? 1 : 2;
+  return static_cast<int>(hit.id);
 }
 
 // =============================================================================
@@ -773,7 +762,7 @@ void View3D::mouseMoveEvent(QMouseEvent* e) {
 
   // 提示文字
   QString h;
-  if (el >= 0 && t == 1) {
+if (el >= 0 && t == 1) {
     h = QStringLiteral("梁 #%1").arg(el);
     if (post_ && el < static_cast<int>(post_->beamResults().size())) {
       const auto& br = post_->beamResults()[static_cast<size_t>(el)];
@@ -787,6 +776,18 @@ void View3D::mouseMoveEvent(QMouseEvent* e) {
       const auto& sr = post_->shellResults()[static_cast<size_t>(el)];
       h += QStringLiteral("  面积=%1m²").arg(fmtNum(sr.area, 3));
     }
+  } else if (el >= 0 && t == 3) {
+    // 节点：从拾取图元里找坐标（含变形），显示 id 与三向坐标。
+    for (const Scene::PickNode& pn : scene_.pickNodes) {
+      if (pn.id == el) {
+        h = QStringLiteral("节点 #%1  (%2, %3, %4) m")
+                .arg(el)
+                .arg(fmtNum(pn.p.x(), 3), fmtNum(pn.p.y(), 3), fmtNum(pn.p.z(), 3));
+        break;
+      }
+    }
+    if (h.isEmpty())
+      h = QStringLiteral("节点 #%1").arg(el);
   }
   if (h != hint_) { hint_ = h; update(); }
 }
@@ -806,26 +807,40 @@ void View3D::mouseReleaseEvent(QMouseEvent* e) {
       d.manhattanLength() < 4) {
     int t = 0;
     const int el = pickAt(e->pos(), &t);
-    if (el >= 0) {
-      if (t == 3) emit nodePicked(el);
-      else {
+if (el >= 0) {
+      if (t == 3) {
+        // 节点拾取：与单元选择互斥 —— 选中节点时清空单元选择。
         sel_.clear();
+        selType_ = 0;
         opt_.selected.clear();
-        selType_ = t;
-        sel_.push_back(el);
-        opt_.selected.push_back(el);
+        selNode_ = el;
+        opt_.selectedNodes.assign({el});
         dirty_ = true;
         update();
-        emit elementPicked(el, t);
+        emit nodePicked(el);
         emit selectionChanged();
         return;
       }
+      sel_.clear();
+      opt_.selected.clear();
+      selType_ = t;
+      sel_.push_back(el);
+      opt_.selected.push_back(el);
+      selNode_ = -1;
+      opt_.selectedNodes.clear();
+      dirty_ = true;
+      update();
+      emit elementPicked(el, t);
+      emit selectionChanged();
+      return;
     }
     // 点空白处 = 取消选择
-    if (el < 0 && !sel_.empty()) {
+    if (!sel_.empty() || selNode_ >= 0) {
       sel_.clear();
       selType_ = 0;
       opt_.selected.clear();
+      selNode_ = -1;
+      opt_.selectedNodes.clear();
       dirty_ = true;
       update();
       emit selectionChanged();
