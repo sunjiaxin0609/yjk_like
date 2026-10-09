@@ -1,0 +1,42 @@
+# 编译产物
+build/
+build*/
+dist/
+out/
+.shot/
+*.o
+*.obj
+*.exe
+*.a
+*.lib
+*.dll
+*.pdb
+*.ilk
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+
+# Qt / moc
+moc_*.cpp
+qrc_*.cpp
+ui_*.h
+*.qmlc
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+
+# 模型文件（结构工程）
+#  *.yjk 是【建模脚本】，属于源码，不忽略
+*.jkr
+*.jmd
+*.out
+
+# aqtinstall 安装日志
+*.log

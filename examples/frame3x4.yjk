@@ -1,0 +1,35 @@
+# =============================================================================
+#  3×3 柱网、4 层混凝土框架 —— yjk_like 示例模型
+#
+#  运行：  yjk run examples/frame3x4.yjk
+#  输出：  frame3x4.json / frame3x4.html / frame3x4.txt
+# =============================================================================
+
+# ---- 材料与截面 ----
+material C30    concrete 30          # C30 混凝土
+section  COL    rect 0.5 0.5         # 柱 500×500
+section  BM     rect 0.3 0.6         # 梁 300×600
+
+# ---- 轴网 ----
+grid.axisX   0 6 12                  # X 向轴线的 y 坐标
+grid.axisY   0 6 12                  # Y 向轴线的 x 坐标
+grid.story   0 3.6 7.2 10.8          # 楼面标高（第一个是基底）
+grid.column  COL C30
+grid.beam    BM  C30
+grid.slabthick 0.12                  # 板厚 120mm
+
+#  剖分：把一跨板/梁再细分。
+#  MITC4 板弯曲完成后，板剖分是可解的（内部节点的 uz 由板弯曲项提供刚度）。
+#  细分同时作用于梁与板，且板边节点与梁节点重合。
+grid.divX   2 2
+grid.divY   2 2
+
+# ---- 支座 ----
+support base fixed                   # 柱脚固接
+
+# ---- 荷载 ----
+selfweight on                        # 梁柱自重
+slabload   4                         # 楼面均布 4 kPa（正数 = 向下）
+nodeload top 15 0 0                  # 顶层每节点 15 kN 水平力（模拟风载）
+
+out frame3x4

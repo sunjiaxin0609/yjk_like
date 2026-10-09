@@ -1,0 +1,61 @@
+# =============================================================================
+#  3×3 柱网、4 层混凝土框架 —— 多工况 + 动态分析示例
+#
+#  运行：  yjk run examples/frame3x4_dynamic.yjk
+#  输出：  frame3x4_dynamic.json / .html / .txt      （主工况 D 三件套）
+#          frame3x4_dynamic.dynamic.json / .dynamic.txt
+#                                                 （模态/反应谱/层剪力/组合内力）
+#
+#  与 frame3x4.yjk 的差异：
+#    · 荷载按工况分组：D 恒载、L 活载、W 风载
+#    · modal 6        —— 前 6 阶模态（频率/周期/参与质量）
+#    · spectrum       —— GB50011 设计反应谱 → 等效地震力工况 Ex/Ey/Ez
+#    · combo          —— 标准组合 S1、基本组合 B1/B2、地震组合 SE + 包络
+# =============================================================================
+
+# ---- 材料与截面 ----
+material C30    concrete 30          # C30 混凝土
+section  COL    rect 0.5 0.5         # 柱 500×500
+section  BM     rect 0.3 0.6         # 梁 300×600
+
+# ---- 轴网 ----
+grid.axisX   0 6 12                  # X 向轴线的 y 坐标
+grid.axisY   0 6 12                  # Y 向轴线的 x 坐标
+grid.story   0 3.6 7.2 10.8          # 楼面标高（第一个是基底）
+grid.column  COL C30
+grid.beam    BM  C30
+grid.slabthick 0.12                  # 板厚 120mm
+grid.divX   2 2                      # 一跨细分 2 段（板/梁同步）
+grid.divY   2 2
+
+# ---- 支座 ----
+support base fixed                   # 柱脚固接
+
+# ---- 工况 D：恒载 ----
+case D
+selfweight on                        # 梁柱自重
+slabload   4                         # 楼面恒载 4 kPa
+
+# ---- 工况 L：活载 ----
+case L
+slabload   2                         # 楼面活载 2 kPa
+
+# ---- 工况 W：风载（顶层水平力，X 向） ----
+case W
+nodeload top 12 0 0
+
+# ---- 动态分析 ----
+modal 6                              # 前 6 阶模态
+spectrum 0.16 0.40 srss              # αmax=0.16（8度小震）, Tg=0.40s, SRSS 组合
+
+# ---- 荷载组合 ----
+# 组合名：S1 标准组合（G+Q）
+#         B1 基本组合·可变控制（1.2G+1.4Q+1.4·0.7W）
+#         B2 基本组合·永久控制（1.35G+1.4·0.7·Q+1.4·0.7W）
+#         SE 地震组合（1.2(G+0.5Q)+1.3Ex）
+combo standard S1  D L
+combo basicvar B1  D L W
+combo basicperm B2 D L W
+combo seismic  SE  D L Ex
+
+out frame3x4_dynamic
