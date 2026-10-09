@@ -400,14 +400,21 @@ void PostProcessor::computeStories(double columnCos) {
                                  ? stories_[s].maxUxy / stories_[s].avgUxy : 0.0;
   }
 
-  // ---- 楼层剪力 ----
+// ---- 楼层剪力 ----
   //
-  //  定义：第 s 层的层剪力 = 该层所有柱（连接 s−1 与 s）的【水平剪力矢量之和的模】。
+  //  定义：第 s 层的层剪力 = 该层所有竖向抗侧力构件的【下端截面】水平
+  //  内力矢量之和。抗侧力构件 = 柱 + 竖直剪力墙。
   //
   //  【必须用矢量和，不能用 Σ|V|】
   //  自重让框架"内缩"会产生一组自平衡的水平力（一半柱子推 +X、一半推 −X，
   //  合力为零）。Σ|V| 会把它们当成剪力计入，实测 40 kN 的基底剪力被算成
   //  40.58 kN。矢量和自动相消。
+  //
+  //  【为什么必须有墙】只有一个 3×3 柱网的框筒，楼面水平力主要由
+  //  电梯井剪力墙承担；若层剪力只统计柱子，第 1 会测出 6.8 kN 而基底
+  //  剪力是 375 kN —— 差 50 倍，剪重比、层剪力分布全错。
+  //  墙是壳单元，用 K·u − f_eq 恢复墙底（story 最小一端）的水平节点力，
+  //  与柱端内力 endForces 是同一个"截面内力"口径，符号一致可直接相加。
   //
   //  校核：最底一层的层剪力 = 所有支座水平反力矢量和的模。
   std::vector<double> sx(stories_.size(), 0.0), sy(stories_.size(), 0.0);
@@ -426,6 +433,64 @@ void PostProcessor::computeStories(double columnCos) {
         break;
       }
   }
+
+// ---- 竖直剪力墙下端水平内力 ----
+  //
+  //  墙壳的"下端" = story 最小的一对节点（墙底标高）。该处水平节点力
+  //  就是墙底截面剪力：f = K·u − f_eq（与梁 endForces 同一口径）。
+  //  墙跨 s−1 与 s 两层，墙底在 s−1 ⇒ 贡献给第 s 层的层剪力。
+  //
+  //  【符号】K·u − f_eq 给出的是"保持位移场所需施加在墙底节点上的
+  //  外力"（与支座反力同向）；层剪力用的是截面内力口径（与楼层惯性
+  //  力同向）。对墙底这组节点两者恒差一个负号——实测取负后
+  //  2×2 单层最小模型（顶层 400 kN 水平力）第 1 层层剪力
+  //  从 274.68 精确闭合到 400.00。
+  for (Id e = 0; e < model_.elementCount(); ++e) {
+    const Element& base = *model_.elements()[static_cast<size_t>(e)];
+    if (base.type() != ElementType::Shell4) continue;
+    const ShellElement& sh = static_cast<const ShellElement&>(base);
+    if (!sh.isWall()) continue;
+
+    const std::vector<Id>& nds = sh.nodes();
+    int lo = INT_MAX, hi = -1;
+    for (Id nd : nds) {
+      const int st = model_.node(nd).story;
+      lo = std::min(lo, st);
+      hi = std::max(hi, st);
+    }
+    if (lo == hi || hi < 0) continue;                     // 水平墙不算
+
+    // 收集单元全局自由度位移
+    std::vector<double> ue(24, 0.0);
+    for (int a = 0; a < 24; ++a) {
+      const Id nd = nds[static_cast<size_t>(a / 6)];
+      const size_t gi = static_cast<size_t>(nd * 6 + a % 6);
+      if (gi < res_.u.size()) ue[static_cast<size_t>(a)] = res_.u[gi];
+    }
+    // K（ShellElement4::stiffness() 返回的是转成全局自由度的刚度）
+    LocalMatrix Kg;
+    if (!sh.stiffnessLocal(Kg)) continue;
+    std::vector<double> fEq;
+    sh.equivalentLoads(fEq);
+    if (fEq.size() < 24) fEq.resize(24, 0.0);
+
+    // f = K·u − f_eq，只取墙底节点（story == lo）的水平分量；
+    // 取负变换到"截面剪力"口径后与柱 endForces 同号可直接相加。
+    double wx = 0.0, wy = 0.0;
+    for (int i = 0; i < 24; ++i) {
+      const Id nd = nds[static_cast<size_t>(i / 6)];
+      if (model_.node(nd).story != lo) continue;
+      double fi = 0.0;
+      for (int c = 0; c < 24; ++c)
+        fi += Kg[static_cast<size_t>(i) * 24 + static_cast<size_t>(c)] * ue[static_cast<size_t>(c)];
+      fi -= fEq[static_cast<size_t>(i)];
+      if (i % 6 == 0) wx -= fi;
+      else if (i % 6 == 1) wy -= fi;
+    }
+    for (size_t s = 0; s < stories_.size(); ++s)
+      if (stories_[s].story == hi) { sx[s] += wx; sy[s] += wy; break; }
+  }
+
   for (size_t s = 0; s < stories_.size(); ++s)
     stories_[s].shear = std::hypot(sx[s], sy[s]);
   (void)columnCos;

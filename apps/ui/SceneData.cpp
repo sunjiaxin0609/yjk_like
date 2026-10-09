@@ -292,12 +292,16 @@ Scene SceneBuilder::build(const RenderOptions& opt) const {
     const bool isSel = std::find(opt.selected.begin(), opt.selected.end(), static_cast<int>(e)) != opt.selected.end();
     const bool isExtreme = (extremeElem == static_cast<int>(e)) && opt.extremeType == 2;
 
-    // 壳单元取值：节点场用四节点平均；构件级云图（弯矩/剪力/轴力）只对梁有意义
-    // —— 此时板用中性色，不能跟着涂成最低档的蓝：那会被读成"板的弯矩为零"，
+// 壳单元取值：节点场用四节点平均；构件级云图（弯矩/剪力/轴力）只对梁有意义
+    // —— 此时板/墙用中性色，不能跟着涂成最低档的蓝：那会被读成"板的弯矩为零"，
     // 而实际上板根本不在这个云图的统计范围内。
     const bool shellHasVal = useNode;
     const double v = shellHasVal ? shellVal[static_cast<size_t>(e)] : 0.0;
-    QColor base = shellHasVal ? ColorMap::of(v, vLo, vHi) : Member::slab();
+    // 未上云图时：竖墙用墙色（与楼板区分——墙是抗侧力构件，扫一眼视图
+    // 就能看出核心筒/电梯井在哪），水平板用板色。
+    const bool isWallElem = static_cast<const ShellElement&>(el).isWall();
+    QColor base = shellHasVal ? ColorMap::of(v, vLo, vHi)
+                              : (isWallElem ? Member::wall() : Member::slab());
     if (hovered) base = Member::hover();
     else if (isSel) base = Member::selected();
     else if (isExtreme) base = Member::highlight();

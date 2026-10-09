@@ -1,0 +1,25 @@
+# ============================================================
+#  单墙悬臂：验证墙底水平反力与顶部水平力对账
+#  1×1 网格，1 层，一片沿 X 的墙（法向 +Y）
+#  顶层 2 节点各施加 +Y 100 kN → 总水平力 200 kN
+#  墙底（支座）Y 向反力矢量和应 = 200 kN
+# ============================================================
+material C30    concrete 30
+section  COL    rect 0.5 0.5
+section  BM     rect 0.3 0.6
+
+grid.axisX   0
+grid.axisY   0
+grid.story   0 3.6
+grid.column  COL C30
+grid.beam    BM  C30
+grid.slabthick 0.12
+grid.slab    off
+grid.wallthick 0.25
+grid.wallx   0 0          # 沿 X 轴线 0 上的墙，跨 Y 向跨度 0（法向 +Y）
+
+support base fixed
+
+nodeload top 0 100 0      # 顶层两节点各 +Y 100 kN
+
+out single_wall

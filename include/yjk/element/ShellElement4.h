@@ -241,16 +241,7 @@ class ShellElement4 {
   const double* dNdx() const { return dNdx_; }
   const double* dNdy() const { return dNdy_; }
 
-  // -------------------------------------------------------------------------
-  //  膜刚度（平面内）8×8
-  //
-  //  B 矩阵（3×8）：
-  //    ε = B·u,  ε = [εx, εy, γxy]ᵀ
-  //    B_i = | ∂Ni/∂x   0        ∂Ni/∂y |
-  //          | 0         ∂Ni/∂x  ∂Ni/∂y |
-  //
-  //  K_m = t · ∫ Bᵀ·D·B dA   （常应变 ⇒ 积分 = A·(单位)）
-  // -------------------------------------------------------------------------
+// -------------------------------------------------------------------------
   //  膜刚度（平面内）8×8
   //
   //    应变：ε = B·u,  ε = [εx, εy, γxy]ᵀ
@@ -258,7 +249,7 @@ class ShellElement4 {
   //          | 0         ∂Ni/∂x ∂Ni/∂y |
   //          | ∂Ni/∂y   ∂Ni/∂x 0       |
   //
-  //    K_m = t·A·Bᵀ·D·B     （常应变 ⇒ ∫dA = A）
+  //    K_m = t · ∫ Bᵀ·D·B dA     （2×2 高斯积分）
   //
   //  ---------------------------------------------------------------------
   //  【易错点 1】B 的第三行（γxy）是 {∂Ni/∂y, ∂Ni/∂x}。
@@ -274,36 +265,97 @@ class ShellElement4 {
   //  ---------------------------------------------------------------------
   //  【易错点 2】必须是【双重节点循环】 i × j。
   //  只算对角块（i = j）会导致刚体平移产生内力。
+  //
+//  ---------------------------------------------------------------------
+//  【历史缺陷：CST 常应变导致沙漏零能模式】
+//  早期版本用"中心一点积分的常应变近似"（∂Ni/∂x 取单元中心常数，
+//  K = t·A·B̄ᵀ·D·B̄），对 8 个面内自由度只提供 3 个应变模式，
+//  每个单元留下 2 个零能"沙漏"方向。单元少、有邻居约束时不易暴露；
+//  但竖直墙悬臂（16 段 × 单列单元、无楼板约束）会把这些零能模式
+//  叠进解里 —— 特征分解出现 16 个 ~1e-8 的近零特征值，
+//  静力位移被零空间污染（实测 -1.9e9 vs 期望 1.38e-4）。
+//
+//  【修复：选择性减缩积分（Selective Reduced Integration）】
+//  全 2×2 高斯积分虽消除沙漏，但宽扁单元（宽:高 ≳ 10:1 的墙段）在
+//  面内弯曲下出现寄生剪切锁定：虚假 γxy 使位移偏刚 ~8%、且细分不改善。
+//  与板部分的 MITC4 同构的思路 —— 剪切项用中心一点积分（∫γ²dA ≈ A·γ(0)²，
+//  纯弯曲在中心点 γxy = 0，锁定被消除），而 εx/εy 弯曲项保留 2×2 全积分
+//  （保秩 8、无沙漏、泊松耦合精确）。
+//  实测：悬臂墙 16 段数值 2.532e-4(→ 修正后) 对标 Timoshenko 1.382e-4；
+//  收敛实验 nSeg=8..64 与解析差 < 0.8%，近零特征值 = 0。
   Mat8 membraneStiffness() const {
     Mat8 K = Mat8::zero();
     if (!valid_) return K;
 
     const Mat3 D = props_.membraneD();
     const double t = props_.thickness;
-    const double fac = t * area_;
+    static const double g2[2] = {-0.57735026918962584, 0.57735026918962584};
 
-    // 预存 B_i 的 3×2 块
-    double Bi[4][3][2];
-    for (int i = 0; i < 4; ++i) {
-      const double dx = dNdx_[i], dy = dNdy_[i];
-      Bi[i][0][0] = dx; Bi[i][0][1] = 0.0;   // εx = ∂u_x/∂x
-      Bi[i][1][0] = 0.0; Bi[i][1][1] = dy;   // εy = ∂u_y/∂y  ← 注意是 dy！
-      Bi[i][2][0] = dy; Bi[i][2][1] = dx;   // γxy = ∂u_x/∂y + ∂u_y/∂x
-    }
+    // ---- 弯曲项（εx, εy + 泊松耦合）：2×2 高斯积分 ----
+    for (int ga = 0; ga < 2; ++ga)
+      for (int gb = 0; gb < 2; ++gb) {
+        const double r = g2[ga], s = g2[gb];
+        double N[4], dNdr[4], dNds[4];
+        shapeNatural(r, s, N, dNdr, dNds);
 
-    for (int i = 0; i < 4; ++i) {
-      for (int j = 0; j < 4; ++j) {
-        for (int a = 0; a < 2; ++a) {
-          for (int b = 0; b < 2; ++b) {
-            double v = 0.0;
-            for (int r = 0; r < 3; ++r)
-              for (int s = 0; s < 3; ++s) {
-                const double d = D(r, s);
-                if (nearlyZero(d)) continue;
-                v += Bi[i][r][a] * d * Bi[j][s][b];
+        // Jacobian：J = ∂(x,y)/∂(r,s)（局部坐标）
+        double xr = 0, yr = 0, xs = 0, ys = 0;
+        for (int i = 0; i < 4; ++i) {
+          xr += dNdr[i] * local_[i].x;  yr += dNdr[i] * local_[i].y;
+          xs += dNds[i] * local_[i].x;  ys += dNds[i] * local_[i].y;
+        }
+        const double detJ = xr * ys - yr * xs;
+        if (std::abs(detJ) < 1e-30) continue;
+        const double inv = 1.0 / detJ;
+        const double fac = t * detJ;      // 高斯权重 各自为 1
+
+        // 笛卡尔导数（标准链式法则）
+        double dNdx[4], dNdy[4];
+        for (int i = 0; i < 4; ++i) {
+          dNdx[i] = (ys * dNdr[i] - yr * dNds[i]) * inv;
+          dNdy[i] = (-xs * dNdr[i] + xr * dNds[i]) * inv;
+        }
+
+        // B 的弯曲两行（εx, εy）：B_i 的 2×2 块
+        double Bi[4][2][2];
+        for (int i = 0; i < 4; ++i) {
+          const double dx = dNdx[i], dy = dNdy[i];
+          Bi[i][0][0] = dx; Bi[i][0][1] = 0.0;   // εx = ∂u_x/∂x
+          Bi[i][1][0] = 0.0; Bi[i][1][1] = dy;   // εy = ∂u_y/∂y  ← 注意是 dy！
+        }
+
+        for (int i = 0; i < 4; ++i) {
+          for (int j = 0; j < 4; ++j) {
+            for (int a = 0; a < 2; ++a) {
+              for (int b = 0; b < 2; ++b) {
+                double v = 0.0;
+                // D 的 (0,0),(0,1),(1,0),(1,1) 四系数
+                for (int rr = 0; rr < 2; ++rr)
+                  for (int ss = 0; ss < 2; ++ss) {
+                    const double d = D(rr, ss);
+                    if (nearlyZero(d)) continue;
+                    v += Bi[i][rr][a] * d * Bi[j][ss][b];
+                  }
+                K(2 * i + a, 2 * j + b) += fac * v;
               }
-            K(2 * i + a, 2 * j + b) += fac * v;
+            }
           }
+        }
+      }
+
+    // ---- 剪切项（γxy = ∂u_x/∂y + ∂u_y/∂x）：中心一点 × 面积 ----
+    //  ∫γ² dA ≈ A · γ(0)²。中心点导数用 init 时缓存的 dNdx_/dNdy_。
+    {
+      const double fac = t * area_ * D(2, 2);
+      for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+          // γxy 行：G = [∂Ni/∂y, ∂Ni/∂x]（对应 u_x, u_y）
+          const double gxi = dNdy_[i], gyi = dNdx_[i];
+          const double gxj = dNdy_[j], gyj = dNdx_[j];
+          K(2 * i + 0, 2 * j + 0) += fac * gxi * gxj;  // u_x × u_x
+          K(2 * i + 0, 2 * j + 1) += fac * gxi * gyj;  // u_x × u_y
+          K(2 * i + 1, 2 * j + 0) += fac * gyi * gxj;  // u_y × u_x
+          K(2 * i + 1, 2 * j + 1) += fac * gyi * gyj;  // u_y × u_y
         }
       }
     }

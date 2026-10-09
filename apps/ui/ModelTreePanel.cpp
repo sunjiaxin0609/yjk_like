@@ -137,18 +137,24 @@ void ModelTreePanel::rebuild() {
                        QStringLiteral(" · %1 根").arg(kv.second)}, 0, -1, 0);
   }
 
-  // ---- 构件（按 类别 → 楼层 分组）----
+// ---- 构件（按 类别 → 楼层 分组）----
   //
   // 【为什么按类别分组而不是按编号平铺】
   // 一个 4 层 3×3 框架就有 87 个单元，平铺出来是一堵墙，找不到东西。
-  // 按"柱/梁/板"分组后，"所有柱"是一个可整体检查的集合，
+  // 按"柱/梁/板/墙"分组后，"所有柱"是一个可整体检查的集合，
   // 这是结构工程师核对模型的实际方式。
+  //
+  // 【为什么墙和板分开两组】
+  // 墙壳与楼板壳在模型树里必须能一眼区分：isWall() 的壳是抗侧力竖构件
+  // （电梯井、核心筒），承担楼层剪力的主体；水平板壳只扛竖向荷载。
+  // 混在一组里，选中一片电梯井墙却显示在"楼板"分组下，会误导画图顺序。
   auto* rootCol = new QTreeWidgetItem(tree_, {QStringLiteral("柱"), QString()});
   auto* rootBeam = new QTreeWidgetItem(tree_, {QStringLiteral("梁"), QString()});
   auto* rootSlab = new QTreeWidgetItem(tree_, {QStringLiteral("楼板"), QString()});
+  auto* rootWall = new QTreeWidgetItem(tree_, {QStringLiteral("剪力墙"), QString()});
 
-  std::map<int, QTreeWidgetItem*> colByStory, beamByStory, slabByStory;
-  int nCol = 0, nBeam = 0, nSlab = 0;
+  std::map<int, QTreeWidgetItem*> colByStory, beamByStory, slabByStory, wallByStory;
+  int nCol = 0, nBeam = 0, nSlab = 0, nWall = 0;
 
   auto groupOf = [&](QTreeWidgetItem* root, std::map<int, QTreeWidgetItem*>& byStory, int story) {
     auto it = byStory.find(story);
@@ -179,23 +185,34 @@ void ModelTreePanel::rebuild() {
         addChild(groupOf(rootBeam, beamByStory, top), {info, kind}, 1, static_cast<int>(e), 1);
         ++nBeam;
       }
-    } else {
+} else {
+      // 壳单元：isWall() 的竖墙进"剪力墙"分组，否则是水平楼板。
+      // 二者同为 Shell4 但承载角色完全不同（抗侧 vs 竖向传荷），
+      // 树上的分组与名称必须反映这一点。
+      const auto& sh = static_cast<const ShellElement&>(el);
       const int top = model_->node(el.nodes()[0]).story;
-      const QString info = QStringLiteral("#%1  %2m²").arg(e).arg(
-          fmtNum(static_cast<const ShellElement&>(el).area(), 3));
-      addChild(groupOf(rootSlab, slabByStory, top), {info, QStringLiteral("板")},
-               1, static_cast<int>(e), 2);
-      ++nSlab;
+      const QString info = QStringLiteral("#%1  %2m²").arg(e).arg(fmtNum(sh.area(), 3));
+      if (sh.isWall()) {
+        addChild(groupOf(rootWall, wallByStory, top), {info, QStringLiteral("墙")},
+                 1, static_cast<int>(e), 2);
+        ++nWall;
+      } else {
+        addChild(groupOf(rootSlab, slabByStory, top), {info, QStringLiteral("板")},
+                 1, static_cast<int>(e), 2);
+        ++nSlab;
+      }
     }
   }
 
   rootCol->setText(1, QString::number(nCol));
   rootBeam->setText(1, QString::number(nBeam));
   rootSlab->setText(1, QString::number(nSlab));
+  rootWall->setText(1, QString::number(nWall));
   // 数量少的类别默认展开，数量多的收起 —— 打开面板第一眼要能看到全貌
   rootCol->setExpanded(nCol <= 30);
   rootBeam->setExpanded(nBeam <= 30);
   rootSlab->setExpanded(false);
+  rootWall->setExpanded(nWall <= 30);
 
   block_ = false;
 }

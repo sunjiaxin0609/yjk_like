@@ -174,9 +174,11 @@ void Model::clearLoads() {
       b->setSelfWeight(false);
       b->clearLineLoad();
     }
-    if (auto* s = dynamic_cast<ShellElement*>(e.get())) {
+if (auto* s = dynamic_cast<ShellElement*>(e.get())) {
       s->setTransversePressure(0.0);
       s->setMembranePressure(0.0, 0.0);
+      s->setSelfWeight(false);
+      // 注意：isWall 是构件属性（拓扑），不属于荷载，不清除。
     }
   }
 }
@@ -222,30 +224,59 @@ Id DofNumbering::assign(std::vector<Node>& nodes,
     slave[static_cast<size_t>(L.slave)] = 1;
   }
 
-  // ---- 第一步：判断每个节点的"绕法向转角"是否为零能量自由度 ----
+// ---- 第一步：判断每个节点的"绕法向转角"是否为零能量自由度 ----
   //
   //  膜/板单元内，绕板面法向（局部 z'）的转角不产生任何面内应变：
-  //  B 矩阵里 rz 只出现在钻转刚度项，而多数模型把钻转刚度设为 0。
+  //  B 矩阵里该转角只出现在钻转刚度项，而多数模型把钻转刚度设为 0。
   //  于是该自由度是"零能量"的 —— 组装出全零行 → 刚度矩阵奇异。
+  //
+  //  【关键：法向不总是全局 Z】竖直墙的壳法向沿 X 或 Y：
+  //    水平板（法向 Z）→ 零能量转角是全局 rz（自由度 5）
+  //    沿 X 轴线的墙（法向 Y）→ 零能量转角是全局 ry（自由度 4）
+  //    沿 Y 轴线的墙（法向 X）→ 零能量转角是全局 rx（自由度 3）
+  //  若像早期实现那样硬编码 rz，竖直墙的 ry/rx 既无梁柱刚度、
+  //  又无自动约束 → K 零对角线 → 求解/模态分解失败。
   //
   //  【梁-壳混合模型的关键区别】梁的 6 个自由度都有物理意义
   //  （含绕自身轴的扭转 r_x），绝不能自动约束。
   //  所以判据是"该节点【只】被壳单元使用"，而不是"被壳单元使用"。
   //
-  //  【为什么不在这里就固定】法向方向依赖单元的节点顺序（逆时针才朝上），
-  //  混排模型的法向可能各不相同。真正的判据是"有没有任何单元给这个 rz 提供刚度"，
-  //  但那需要先组装 —— 所以这里采取保守策略：只被壳使用的节点自动约束 rz，
-  //  并允许用户通过 Node::normalRotationActive 显式覆盖。
+  //  【法向冲突的节点不再自动约束】同一节点同时被法向 X 与法向 Y 的
+  //  壳使用（如电梯井 L 形墙角）：两片墙互相给对方的面外弯曲转动提供
+  //  刚度，rx 与 ry 都不是零能量 —— 只有某个转动方向对【所有】相连壳
+  //  都是法向时才是全局零能量。多壳法向不一致时不做自动约束（保持自由，
+  //  若确无刚度由 hasStiff 的零刚度检测兜底）。
+  //
+  //  【为什么不在编号时固定法向方向】法向方向依赖单元的节点顺序
+  //  （逆时针才朝上），但【零能量判断只看法向所在的轴】——
+  //  法向 ±X/±Y/±Z 归为同一主轴，符号不参与判定，因此顺序无关。
+  std::vector<int> shellRotAxis(static_cast<size_t>(n), -1);  // -1=无壳/冲突，0/1/2=X/Y/Z
   for (Id i = 0; i < n; ++i) {
-    if (shellTouches(elems, i) && !beamTouches(elems, i)) {
-      nodes[static_cast<size_t>(i)].normalRotationActive = false;
+    if (!shellTouches(elems, i) || beamTouches(elems, i)) continue;
+    int axis = -1;                 // 已见到的壳法向主轴
+    bool conflict = false;
+    for (const auto& ep : elems) {
+      if (ep->type() != ElementType::Shell4) continue;
+      bool touches = false;
+      for (Id x : ep->nodes())
+        if (x == i) { touches = true; break; }
+      if (!touches) continue;
+      const Vec3 nrm = ep->normal();
+      int a = -1;
+      if (std::abs(nrm.x) > 0.999999) a = 0;      // 法向沿 X（Y 向墙）
+      else if (std::abs(nrm.y) > 0.999999) a = 1; // 法向沿 Y（X 向墙）
+      else if (std::abs(nrm.z) > 0.999999) a = 2; // 法向沿 Z（水平板）
+      if (a < 0) { conflict = true; break; }      // 斜壳：无法归入主轴
+      if (axis < 0) axis = a;
+      else if (axis != a) { conflict = true; break; }
     }
+    if (!conflict && axis >= 0) shellRotAxis[static_cast<size_t>(i)] = axis;
+    // 冲突或无壳 → 保持 -1：不自动约束，交给 hasStiff 零刚度检测。
   }
-
-  // 记录被壳单元使用的节点（第三步分配自由度时要用）
-  std::vector<char> usedByShell(static_cast<size_t>(n), 0);
-  for (Id i = 0; i < n; ++i)
-    if (shellTouches(elems, i)) usedByShell[static_cast<size_t>(i)] = 1;
+  for (Id i = 0; i < n; ++i) {
+    if (shellRotAxis[static_cast<size_t>(i)] >= 0)
+      nodes[static_cast<size_t>(i)].normalRotationActive = false;
+  }
 
   // ---- 悬空节点（不属于任何单元）的处理 ----
   //
@@ -341,11 +372,15 @@ std::vector<char> orphan(static_cast<size_t>(n), 0);
         ++nconstrained_;
         continue;
       }
-      // 壳单元节点的绕法向转角：若既没被梁使用、也没显式激活，则自动约束。
-      // 判据：rz（自由度 5）在壳单元里不产生任何应变 → 零能量 → 必须约束。
-      // 判据"是否被梁使用"通过是否显式 fixed[5] 或 normalRotationActive 表达。
-      if (k == 5 && usedByShell[idx] && !nd.normalRotationActive
-          && !beamTouches(elems, idx)) {
+// 壳单元节点的绕法向转角：若既没被梁使用、也没显式激活，则自动约束。
+      // 判据不是固定 rz —— 而是该节点所有相连壳的法向主轴（第一步已算好）：
+      //   水平板 → rz(5)；X 向墙 → rx(3)；Y 向墙 → ry(4)。
+      // 零能量自由度 = 绕板面法向的转角，法向沿哪根主轴就约束哪个转动分量。
+      // 判据"是否被梁使用"已在第一步计入：被梁使用的节点 shellRotAxis = -1。
+      const int rotAxis = shellRotAxis[static_cast<size_t>(idx)];
+      const int rotComp = (rotAxis == 0) ? 3 : (rotAxis == 1) ? 4
+                                                               : 5;  // X→rx, Y→ry, Z→rz
+      if (rotAxis >= 0 && k == rotComp && !nd.normalRotationActive) {
         nd.dof[k] = -1;
         ++nconstrained_;
         ++nauto_;
@@ -370,13 +405,12 @@ if (slave[static_cast<size_t>(idx) * 6 + k]) {
       // 也由约束方程提供行为，不能锁定。
       // 【排除刚性楼板主节点】：主节点不被单元引用，但它的刚度由
       // MPC 从属节点折合而来 —— 绝不能当成零刚度锁掉（否则楼层被钉死）。
-      // 【排除壳法向已激活的 rz】：normalRotationActive 时 rz 是用户
+      // 【排除壳法向已激活的转角】：normalRotationActive 时该转动是用户
       // 显式保留的自由度，由求解器/check 决定其命运，编号阶段不动它。
-      // 【有节点荷载时保持自由】：交给 check() 的零刚度加载检测报错
-      // （自动锁定会把荷载悄悄吞掉，比报错更危险）。
-if (hasStiff[static_cast<size_t>(idx) * 6 + static_cast<size_t>(k)] == 0 &&
+      const int rotC = (rotAxis == 0) ? 3 : (rotAxis == 1) ? 4 : 5;
+      if (hasStiff[static_cast<size_t>(idx) * 6 + static_cast<size_t>(k)] == 0 &&
           !nd.diaphragmMaster &&
-          !(k == 5 && usedByShell[idx] && nd.normalRotationActive)) {
+          !(rotAxis >= 0 && k == rotC && nd.normalRotationActive)) {
         // 【按分量方向判荷载】—— 不能按"节点整体有无荷载"判断。
         // 例：悬臂梁 j 端释放 ry/rz、荷载加在同节点的 uz 方向 ——
         //   uz 有刚度正常求解；ry/rz 无刚度且【对应方向无荷载】，

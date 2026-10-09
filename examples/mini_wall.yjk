@@ -1,0 +1,25 @@
+# ============================================================
+#  最小对账实验：2×2 轴网、1 层、一片沿 X 的墙
+#  顶层水平力 +Y 100 kN/节点（顶层 4 节点 → 总 400 kN）
+#  验证：第 1 层层剪力（柱+墙）应 = 基底水平反力矢量和
+# ============================================================
+material C30    concrete 30
+section  COL    rect 0.5 0.5
+section  BM     rect 0.3 0.6
+
+grid.axisX   0 6
+grid.axisY   0 6
+grid.story   0 3.6
+grid.column  COL C30
+grid.beam    BM  C30
+grid.slabthick 0.12
+grid.slab    off
+grid.wallthick 0.25
+grid.wallx   0 0
+grid.wally   0 0
+
+support base fixed
+
+nodeload top 0 100 0
+
+out mini_wall

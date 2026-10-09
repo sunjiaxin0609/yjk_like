@@ -40,3 +40,8 @@ ui_*.h
 
 # aqtinstall 安装日志
 *.log
+
+# yjk run 派生的运行产物（html/json/txt 报告，与 examples/*.yjk 建模脚本同名）
+/frame_wall.*
+/mini_wall.*
+/single_wall.*

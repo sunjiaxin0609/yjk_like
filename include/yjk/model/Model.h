@@ -419,8 +419,23 @@ class ShellElement : public Element {
   ElementType type() const override { return ElementType::Shell4; }
   std::string typeName() const override { return "壳单元 4 节点"; }
   double length() const override { return 0.0; }
-  double mass() const override { return sh_.mass(); }
+double mass() const override { return sh_.mass(); }
   Vec3 normal() const override { return sh_.normal(); }
+
+  // ---- 剪力墙标志 ----
+  //  GridMesh 生成轴线上的竖直墙壳时置真。用途：
+  //    · selfweight 命令只把自重开给墙（水平板不吃，避免向既有
+  //      模型注入板重造成回归）；
+  //    · 楼层剪力统计把竖直墙下端的水平内力计入（见 PostProcessor）。
+  void setWall(bool w) { isWall_ = w; }
+  bool isWall() const { return isWall_; }
+
+  // ---- 自重（T4）----
+  //  墙自重由壳的 mass() 提供（= γ·t·A，γ 由 density 换算），
+  //  以等效节点荷载进入模型，方向永远是全局 -Z —— 不能走
+  //  setTransversePressure：那沿壳法向，竖直墙法向是水平的，方向就错了。
+  void setSelfWeight(bool on) { selfWeightOn_ = on; }
+  bool selfWeight() const { return selfWeightOn_; }
 
   bool stiffnessLocal(LocalMatrix& K) const override {
     if (!sh_.isValid()) return false;
@@ -431,7 +446,7 @@ class ShellElement : public Element {
     return true;
   }
 
-  void equivalentLoads(std::vector<double>& f) const override {
+void equivalentLoads(std::vector<double>& f) const override {
     f.assign(24, 0.0);
     if (!sh_.isValid()) return;
     if (pz_ != 0.0) {
@@ -442,6 +457,14 @@ class ShellElement : public Element {
       const Vec24d p = sh_.membranePressure(px_, py_);
       for (int i = 0; i < 24; ++i) f[i] += p[i];
     }
+    if (selfWeightOn_) {
+      // 自重（kN）均分到 4 个角节点，方向为全局 -Z（重力向下）。
+      //  【为什么均分】壳的自重是均匀体积力，四节点等效节点荷载
+      //  各取 W/4（对任意平面四边形，常体力在双线性插值下的
+      //  等效节点力正是均分）—— Σf = W，剪重比分母对账的前提。
+      const double w4 = sh_.mass() / 4.0;
+      for (int n = 0; n < 4; ++n) f[static_cast<size_t>(n * 6 + 2)] -= w4;
+    }
   }
 
   ShellElement4::MembraneForces shellMembraneForces(const std::vector<double>& uEl) const override {
@@ -450,7 +473,7 @@ class ShellElement : public Element {
     return sh_.membraneForces(ue);
   }
 
-  void setTransversePressure(double p) { pz_ = p; }
+void setTransversePressure(double p) { pz_ = p; }
   void setMembranePressure(double px, double py) { px_ = px; py_ = py; }
   double area() const { return sh_.area(); }
   bool plateReady() const;
@@ -462,6 +485,8 @@ private:
   std::string err_;
   double pz_{0.0};
   double px_{0.0}, py_{0.0};
+  bool selfWeightOn_{false};
+  bool isWall_{false};
 };
 
 // -----------------------------------------------------------------------------

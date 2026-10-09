@@ -93,6 +93,18 @@ bool AxisGrid::setSlabStory(Id s, bool on) {
   slabStory_[static_cast<size_t>(s)] = on ? 1 : 0;
   return true;
 }
+bool AxisGrid::setWallAlongX(Id ix, Id jy, bool on) {
+  if (ix < 0 || jy < 0 || ix >= nx() || jy + 1 >= ny()) return false;
+  ensure(wallX_, static_cast<size_t>(nx()) * ny(), 0);
+  wallX_[static_cast<size_t>(ix) * ny() + jy] = on ? 1 : 0;
+  return true;
+}
+bool AxisGrid::setWallAlongY(Id jy, Id ix, bool on) {
+  if (jy < 0 || ix < 0 || jy >= ny() || ix + 1 >= nx()) return false;
+  ensure(wallY_, static_cast<size_t>(nx()) * ny(), 0);
+  wallY_[static_cast<size_t>(ix) * ny() + jy] = on ? 1 : 0;
+  return true;
+}
 bool AxisGrid::setDivX(Id jy, int n) {
   if (jy < 0 || jy + 1 >= ny() || n < 1) return false;
   divX_.resize(static_cast<size_t>(ny()) - 1, 1);
@@ -124,6 +136,14 @@ bool AxisGrid::hasSlab(Id ix, Id jy) const {
 }
 bool AxisGrid::hasSlabStory(Id s) const {
   return static_cast<size_t>(s) < slabStory_.size() ? slabStory_[static_cast<size_t>(s)] != 0 : true;
+}
+bool AxisGrid::hasWallAlongX(Id ix, Id jy) const {
+  const size_t k = static_cast<size_t>(ix) * ny() + jy;
+  return k < wallX_.size() ? wallX_[k] != 0 : false;   // 默认关：未设置即无墙
+}
+bool AxisGrid::hasWallAlongY(Id jy, Id ix) const {
+  const size_t k = static_cast<size_t>(ix) * ny() + jy;
+  return k < wallY_.size() ? wallY_[k] != 0 : false;   // 默认关：未设置即无墙
 }
 int AxisGrid::divX(Id jy) const {
   return static_cast<size_t>(jy) < divX_.size() ? divX_[static_cast<size_t>(jy)] : 1;
@@ -169,6 +189,8 @@ bool AxisGrid::sortAxes() {
   beamX_.clear();
   beamY_.clear();
   slab_.clear();
+  wallX_.clear();
+  wallY_.clear();
   return true;
 }
 
@@ -209,7 +231,8 @@ void AxisGrid::buildPoints() const {
 std::string GridMesh::Result::message() const {
   if (!ok) return error.empty() ? "网格生成失败" : error;
   return "网格生成成功：节点 " + std::to_string(nodes) + "，柱 " + std::to_string(columns) +
-         "，梁 " + std::to_string(beams) + "，板 " + std::to_string(slabs);
+         "，梁 " + std::to_string(beams) + "，板 " + std::to_string(slabs) +
+         "，墙 " + std::to_string(walls);
 }
 
 GridMesh::Result GridMesh::generate(Model& m) {
@@ -322,6 +345,61 @@ GridMesh::Result GridMesh::generate(Model& m) {
       }
   }
 
+  // ---- 墙：轴线上的竖直壳，跨楼层 z[s]→z[s+1] 一段 ----
+  //
+  //  节点顺序（逆时针，法向由 cross(p1-p0, p2-p0) 定，见 ShellElement4）：
+  //
+  //  沿 X 的墙（位置由 y 定，跨 jy 沿 x 展开）：
+  //      0 = (x[p],   y, z[s+1])   顶左
+  //      1 = (x[p+1], y, z[s+1])   顶右
+  //      2 = (x[p+1], y, z[s]  )   底右
+  //      3 = (x[p],   y, z[s]  )   底左
+  //    ⇒ p1-p0 = (+Δx, 0, 0)，p2-p0 = (+Δx, 0, −Δz)，法向 = +Y
+  //
+  //  沿 Y 的墙（位置由 x 定，跨 ix 沿 y 展开）：
+  //      0 = (x, y[q],   z[s])     底前
+  //      1 = (x, y[q+1], z[s])     底后
+  //      2 = (x, y[q+1], z[s+1])   顶后
+  //      3 = (x, y[q],   z[s+1])   顶前
+  //    ⇒ p1-p0 = (0, +Δy, 0)，p2-p0 = (0, +Δy, +Δz)，法向 = +X
+  //
+  //  【法向为什么朝 +Y / +X 而不是相反】壳的面外内力、面荷载符号都跟法向
+  //  绑定。约定"沿 X 墙朝 +Y、沿 Y 墙朝 +X"后，墙两侧的符号唯一确定，
+  //  将来加压/读面内应力不会出现"同一面墙左右符号相反"的歧义。
+  //  这不影响刚度（两个方向的弯曲/膜刚度等价），只影响符号约定。
+  //
+  //  【必须用 nodeAt 取节点】墙顶/墙底必须与楼面节点重合 —— 否则墙顶的
+  //  水平力传不到楼板/梁上，模型"看起来正常"但结果全错（与板同理）。
+  if (spec_.buildWalls)
+  for (Id s = 0; s + 1 < ns; ++s) {
+    // 沿 X 的墙：X 向轴线 ix 上，跨 jy
+    for (Id ix = 0; ix < nx; ++ix) {
+      const Id q = grid_.yAxisIndex(ix);
+      for (Id jy = 0; jy + 1 < ny; ++jy) {
+        if (!grid_.hasWallAlongX(ix, jy)) continue;
+        const Id p0 = grid_.xAxisIndex(jy), p1 = grid_.xAxisIndex(jy + 1);
+        for (Id p = p0; p < p1; ++p) {
+          std::vector<Id> n4{nodeAt(p, q, s + 1), nodeAt(p + 1, q, s + 1),
+                             nodeAt(p + 1, q, s), nodeAt(p, q, s)};
+          if (ShellElement* w = m.addShell(n4, spec_.wall)) { w->setWall(true); ++r.walls; }
+        }
+      }
+    }
+    // 沿 Y 的墙：Y 向轴线 jy 上，跨 ix
+    for (Id jy = 0; jy < ny; ++jy) {
+      const Id p = grid_.xAxisIndex(jy);
+      for (Id ix = 0; ix + 1 < nx; ++ix) {
+        if (!grid_.hasWallAlongY(jy, ix)) continue;
+        const Id q0 = grid_.yAxisIndex(ix), q1 = grid_.yAxisIndex(ix + 1);
+        for (Id q = q0; q < q1; ++q) {
+          std::vector<Id> n4{nodeAt(p, q, s), nodeAt(p, q + 1, s),
+                             nodeAt(p, q + 1, s + 1), nodeAt(p, q, s + 1)};
+          if (ShellElement* w = m.addShell(n4, spec_.wall)) { w->setWall(true); ++r.walls; }
+        }
+      }
+    }
+  }
+
   r.nodes = m.nodeCount() - baseNode;
   r.ok = true;
   return r;
@@ -396,6 +474,11 @@ GridMesh::SlabLoadReport GridMesh::applySlabLoad(Model& m,
     for (auto& e : m.elements()) {
       if (e->type() != ElementType::Shell4) continue;
       auto* sh = static_cast<ShellElement*>(e.get());
+      // 【墙不吃楼面荷载】slabload 是【楼面】均布荷载，只该压水平板壳。
+      // 竖直墙的法向是水平方向 —— 若把它也压上 transversePressure，
+      // 墙会凭空受一面"水平面压"，污染墙内力和楼层剪力，而且
+      // 这个水平压力还会被下面的守恒统计当成"荷载"计进 total。
+      if (sh->isWall()) continue;
       // 脚本里正数表示向下（工程习惯），单元里 -z 为向下
       sh->setTransversePressure(-opt.q);
       rep.total += opt.q * sh->area();

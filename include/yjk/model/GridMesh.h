@@ -26,6 +26,9 @@
 //    · 楼层 s 的楼面标高 z[s]；柱从 z[s] 连到 z[s+1]
 //    · 壳单元节点按 (p,q)→(p+1,q)→(p+1,q+1)→(p,q+1) 排列，
 //      在 +X→+Y 的手系下法向朝 +Z（朝上），符合 ShellElement4 的约定
+//    · 墙（剪力墙）：位于【轴线上】的竖直壳，跨楼层 z[s]→z[s+1] 一段。
+//      沿 X 的墙在 X 向轴线 ix 上（y 固定），跨 jy；沿 Y 的墙在 Y 向轴线 jy
+//      上（x 固定），跨 ix。节点顺序与法向约定见 generate() 内的注释。
 //
 //  【不做什么】不生成荷载、不生成支座。这两件事依赖具体工程判断，
 //  由用户在生成后按 nodeAtAxis() 查到的节点号自行施加。
@@ -63,13 +66,20 @@ class AxisGrid {
   const std::string& axisYLabel(Id j) const { return xLabel_[static_cast<size_t>(j)]; }
 
   // ---- 构件开关 ----
-  //  所有开关默认"开"（楼板默认不含底层，见 setSlabStory 的说明）。
+  //  除墙外所有开关默认"开"（楼板默认不含底层，见 setSlabStory 的说明）。
+  //
+  //  【为什么墙默认"关"】柱/梁/板是"框架楼盖必然有"的构件；墙则不是
+  //  每个轴网都有的 —— 若默认开，既有框架模型会凭空多出满轴线的墙，
+  //  刚度、质量、自重全变。所以墙的开关语义与其他构件相反：**不设即无墙**。
+  //
   //  索引越界时返回 false 且不改变状态 —— 建模阶段的参数错误不该抛异常。
   bool setColumn(Id ix, Id jy, bool on);          // 交点 (ix,jy) 是否有柱
   bool setBeamAlongX(Id ix, Id jy, bool on);      // 沿 X 的梁：X 向轴线 ix，跨 jy
   bool setBeamAlongY(Id jy, Id ix, bool on);      // 沿 Y 的梁：Y 向轴线 jy，跨 ix
   bool setSlab(Id ix, Id jy, bool on);            // 板格 (ix,jy) 是否有板
   bool setSlabStory(Id s, bool on);               // 第 s 层楼面是否有板
+  bool setWallAlongX(Id ix, Id jy, bool on);      // 沿 X 的墙：X 向轴线 ix，跨 jy
+  bool setWallAlongY(Id jy, Id ix, bool on);      // 沿 Y 的墙：Y 向轴线 jy，跨 ix
   bool setDivX(Id jy, int n);                     // Y 向跨度 jy 沿 X 的剖分数（≥1）
   bool setDivY(Id ix, int n);                     // X 向跨度 ix 沿 Y 的剖分数（≥1）
 
@@ -78,6 +88,8 @@ class AxisGrid {
   bool hasBeamAlongY(Id jy, Id ix) const;
   bool hasSlab(Id ix, Id jy) const;
   bool hasSlabStory(Id s) const;
+  bool hasWallAlongX(Id ix, Id jy) const;
+  bool hasWallAlongY(Id jy, Id ix) const;
   int divX(Id jy) const;
   int divY(Id ix) const;
 
@@ -104,6 +116,7 @@ class AxisGrid {
   std::vector<double> y_, x_, z_;                  // X向轴线(y) / Y向轴线(x) / 楼面标高
   std::vector<std::string> yLabel_, xLabel_, zLabel_;
   std::vector<char> col_, beamX_, beamY_, slab_;   // 开关，索引 = ix*ny+jy
+  std::vector<char> wallX_, wallY_;                // 墙开关，同一索引（默认关）
   std::vector<char> slabStory_;
   std::vector<int> divX_, divY_;
   // 细分后的一维坐标表（buildPoints 的缓存，逻辑上是 const）
@@ -116,11 +129,12 @@ class AxisGrid {
 // -----------------------------------------------------------------------------
 class GridMesh {
  public:
-  // 构件规格。柱与梁用梁单元，板用壳单元。
+  // 构件规格。柱与梁用梁单元，板与墙用壳单元。
   struct Spec {
     SectionProperties columnSection, beamSection;
     Material columnMaterial, beamMaterial;
     ShellProperties slab;
+    ShellProperties wall;           // 剪力墙规格（默认厚 0.2 混凝土壳）
 
     // 局部 up 方向（决定 Iy/Iz 哪个是平面内 —— 见 BeamElement3D 的说明）
     //
@@ -142,12 +156,16 @@ class GridMesh {
     //  【这两件事必须成对】只关掉板而不导荷，楼面荷载会凭空消失 ——
     //  而模型仍然可解、残差正常，只有"总荷载对不上"这一条能暴露它。
     bool buildSlabs{true};
+
+    // 是否生成墙【壳单元】。轴网上没有墙开关时（AxisGrid 默认无墙），
+    // 此开关不产生任何单元。
+    bool buildWalls{true};
   };
 
   struct Result {
     bool ok{false};
     std::string error;
-    Id nodes{0}, columns{0}, beams{0}, slabs{0};
+    Id nodes{0}, columns{0}, beams{0}, slabs{0}, walls{0};
     std::string message() const;
   };
 

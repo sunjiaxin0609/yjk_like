@@ -170,12 +170,21 @@ if(YJK_BUILD_TESTS)
   target_link_libraries(test_spring PRIVATE yjk_core)
   add_test(NAME spring COMMAND test_spring)
 
-  # 命令行冒烟：用示例模型跑完整条链路并写出三个结果文件。
+# 命令行冒烟：用示例模型跑完整条链路并写出三个结果文件。
   # 这条测试保护的是"各模块能不能接起来"，而不是数值正确性 ——
   # 后者由上面各套件负责。
   add_test(NAME cli_smoke
            COMMAND yjk run ${CMAKE_CURRENT_SOURCE_DIR}/examples/frame3x4.yjk
                    -o ${CMAKE_CURRENT_BINARY_DIR}/cli_smoke)
+
+  # 剪力墙 P2：墙进入轴网/网格/脚本/自重/楼层剪力 整条链路
+  #   test_wall —— 节点重合（墙与梁板共用 nodeAt）、悬臂墙解析解（Timoshenko）、
+  #                双墙并联（刚度翻倍/反力平分）、墙底剪力对账（层剪力 =
+  #                基底水平反力）、墙模态（质量与基频）、端到端 frame_wall.yjk
+  add_executable(test_wall tests/test_wall.cpp)
+  target_link_libraries(test_wall PRIVATE yjk_core)
+  add_test(NAME wall COMMAND test_wall
+           ${CMAKE_CURRENT_SOURCE_DIR}/examples/frame_wall.yjk)
 endif()
 
 # ============================================================

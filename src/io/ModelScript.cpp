@@ -463,6 +463,58 @@ bool ModelScript::build(Model& m, std::string* info) {
       }
       continue;
     }
+    if (c.name == "grid.wall") {
+      // grid.wall on|off —— 是否生成墙【壳单元】。
+      //
+      //  【与 AxisGrid 墙开关的配合】AxisGrid 默认无墙（不设即无墙），
+      //  所以 grid.wall on 本身不会凭空生成墙；必须配合 grid.wallx /
+      //  grid.wally 先在轴网上开墙段。grid.wall off 用于整模型关墙。
+      if (!need(c, 1)) continue;
+      const std::string v = lower(a[0]);
+      if (v == "on" || v == "1" || v == "true") meshSpec_.buildWalls = true;
+      else if (v == "off" || v == "0" || v == "false") meshSpec_.buildWalls = false;
+      else { errors_.push_back("第 " + std::to_string(c.line) +
+                               " 行：grid.wall 的参数应为 on / off"); continue; }
+      if (mesh_) {
+        errors_.push_back("第 " + std::to_string(c.line) +
+                          " 行：grid.wall 必须写在任何需要生成网格的命令之前"
+                          "（它决定网格怎么生成）");
+      }
+      continue;
+    }
+    if (c.name == "grid.wallthick") {
+      if (!need(c, 1)) continue;
+      double t = 0.2;
+      if (!toNum(a[0], t) || !(t > 0.0)) {
+        errors_.push_back("第 " + std::to_string(c.line) + " 行：墙厚必须为正数");
+        continue;
+      }
+      meshSpec_.wall.thickness = t;
+      continue;
+    }
+    if (c.name == "grid.wallx" || c.name == "grid.wally" ||
+        c.name == "grid.nowallx" || c.name == "grid.nowally") {
+      // 墙段开关（索引一律 0 基，越界只警告不报错，与 nobeamx 一致）：
+      //   grid.wallx  <ix> <jy>   在 X 向轴线 ix、Y 向跨度 jy 加墙
+      //   grid.wally  <jy> <ix>   在 Y 向轴线 jy、X 向跨度 ix 加墙
+      //   grid.nowallx <ix> <jy>  移除该墙段
+      //   grid.nowally <jy> <ix>  移除该墙段
+      if (!need(c, 2)) continue;
+      int i0 = 0, i1 = 0;
+      if (!toInt(a[0], i0) || !toInt(a[1], i1)) {
+        errors_.push_back("第 " + std::to_string(c.line) + " 行：索引必须是整数");
+        continue;
+      }
+      bool okk = false;
+      if (c.name == "grid.wallx") okk = grid_.setWallAlongX(i0, i1, true);
+      else if (c.name == "grid.wally") okk = grid_.setWallAlongY(i0, i1, true);
+      else if (c.name == "grid.nowallx") okk = grid_.setWallAlongX(i0, i1, false);
+      else okk = grid_.setWallAlongY(i0, i1, false);
+      if (!okk) warnings_.push_back("第 " + std::to_string(c.line) + " 行：索引 (" +
+                                    std::to_string(i0) + "," + std::to_string(i1) +
+                                    ") 越界，已忽略");
+      continue;
+    }
     if (c.name == "diaphragm") {
       // diaphragm on [起始层]   —— 加刚性楼板假定（默认从第 1 层起）
       // diaphragm off           —— 不加（默认）
@@ -804,6 +856,14 @@ bool ModelScript::applyLoadCmd(Model& m, const Command& c, std::string* info) {
     for (auto& e : m.elements()) {
       if (e->type() != ElementType::Beam3D) continue;
       static_cast<BeamElement*>(e.get())->setSelfWeight(on);
+    }
+    // 剪力墙自重（T4）：只对墙壳开关，水平板壳不吃自重 ——
+    // 板的重量由 slabload 面荷载体现，若把板也包进来，既有
+    // 轴网模型会凭空多出一大块重量（板自重），破坏 18 个测试。
+    for (auto& e : m.elements()) {
+      if (e->type() != ElementType::Shell4) continue;
+      ShellElement* s = static_cast<ShellElement*>(e.get());
+      if (s->isWall()) s->setSelfWeight(on);
     }
     return true;
   }

@@ -1,0 +1,42 @@
+# =============================================================================
+#  3×3 柱网、4 层框架 + 电梯井剪力墙 —— yjk_like 剪力墙示例
+#
+#  运行：  yjk run examples/frame_wall.yjk
+#  输出：  frame_wall.json / frame_wall.html / frame_wall.txt / frame_wall.dynamic.*
+# =============================================================================
+
+# ---- 材料与截面 ----
+material C30    concrete 30          # C30 混凝土
+section  COL    rect 0.5 0.5         # 柱 500×500
+section  BM     rect 0.3 0.6         # 梁 300×600
+
+# ---- 轴网 ----
+grid.axisX   0 6 12                  # X 向轴线的 y 坐标
+grid.axisY   0 6 12                  # Y 向轴线的 x 坐标
+grid.story   0 3.6 7.2 10.8          # 楼面标高（第一个是基底）
+grid.column  COL C30
+grid.beam    BM  C30
+grid.slabthick 0.12                  # 板厚 120mm
+
+#  剖分：把一跨板/梁再细分（墙与梁板共用同一细分点，天然重合）。
+grid.divX   2 2
+grid.divY   2 2
+
+# ---- 剪力墙（电梯井：围绕中间 6×6 区的两道正交墙）----
+grid.wallthick 0.25                  # 墙厚 250mm
+# 沿 X 的墙：X 向轴线 1（y=6）上, 跨 Y 向跨度 0 和 1
+grid.wallx   1 0
+grid.wallx   1 1
+# 沿 Y 的墙：Y 向轴线 1（x=6）上, 跨 X 向跨度 0 和 1
+grid.wally   1 0
+grid.wally   1 1
+
+# ---- 支座 ----
+support base fixed                   # 柱脚固接（墙底与柱脚共用节点）
+
+# ---- 荷载 ----
+selfweight on                        # 梁柱自重
+slabload   4                         # 楼面均布 4 kPa（正数 = 向下）
+nodeload top 0 15 0                  # 顶层每节点 15 kN Y 向水平力（模拟风载）
+
+out frame_wall
