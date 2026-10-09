@@ -72,6 +72,8 @@ void setHighlightExtreme(int elem, int type);
   void selectElement(int elem, int type);
   const std::vector<int>& selection() const { return sel_; }
   int selectionType() const { return selType_; }
+  // 选中的节点 id（-1 = 未选中节点）。节点与单元选择互斥（见 pickAt）。
+  int selectedNode() const { return selNode_; }
 
   // ---- T4 创建工具 ----
   // 工具态下左键单击 = 拾取节点（发 buildNodeHit），左键拖拽 = 框选

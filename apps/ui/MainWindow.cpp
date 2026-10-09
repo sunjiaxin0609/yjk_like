@@ -31,7 +31,11 @@
 #include <QElapsedTimer>
 #include <QTime>
 
+#include <QMimeData>
+
+#include <algorithm>
 #include <cmath>
+#include <utility>
 
 #include "ModelTreePanel.h"
 #include "PropertyPanel.h"
@@ -85,8 +89,10 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
   setWindowTitle(QStringLiteral("yjk_like  ——  结构分析"));
   resize(1480, 900);
 
-  view_ = new View3D(this);
+view_ = new View3D(this);
   setCentralWidget(view_);
+
+  cmds_ = std::make_unique<yjk::interact::CommandStack>(50);   // T5 撤销/重做栈
 
   buildActions();
   buildMenus();
@@ -105,8 +111,11 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     tree_->selectElement(e, t);
   });
   connect(view_, &View3D::nodePicked, this, [this](int n) { prop_->showNode(n); });
-  connect(view_, &View3D::selectionChanged, this, [this] {
+connect(view_, &View3D::selectionChanged, this, [this] {
     if (view_->selection().empty()) prop_->clear();
+    // T5：有选中对象才允许 Delete
+    if (actDelete_)
+      actDelete_->setEnabled(!view_->selection().empty() || view_->selectedNode() >= 0);
   });
   connect(view_, &View3D::viewChanged, this, [this] { syncOptionsToView(); });
 
@@ -223,6 +232,26 @@ actContour_ = new QAction(QStringLiteral("显示云图"), this);
   for (QAction* a : {actToolBeam_, actToolColumn_, actToolWall_, actToolSlab_,
                      actToolLoad_})
     toolGroup_->addAction(a);
+
+  // ---- T5 撤销 / 重做 / 删除 ----
+  // 撤销/重做是全局编辑动作（WindowShortcut）；删除归 view_ 且 WidgetShortcut：
+  // 只在视口有焦点时生效，避免属性面板输入框里按 Delete 误删整个选中对象。
+  actUndo_ = new QAction(QStringLiteral("撤销"), this);
+  actUndo_->setShortcut(QKeySequence::Undo);
+  actUndo_->setEnabled(false);
+  connect(actUndo_, &QAction::triggered, this, &MainWindow::onUndo);
+
+  actRedo_ = new QAction(QStringLiteral("重做"), this);
+  actRedo_->setShortcut(QKeySequence::Redo);
+  actRedo_->setEnabled(false);
+  connect(actRedo_, &QAction::triggered, this, &MainWindow::onRedo);
+
+  actDelete_ = new QAction(QStringLiteral("删除选中"), view_);
+  actDelete_->setShortcut(QKeySequence::Delete);
+  actDelete_->setShortcutContext(Qt::WidgetShortcut);
+  actDelete_->setEnabled(false);
+  actDelete_->setToolTip(QStringLiteral("删除选中的构件/节点（可撤销）"));
+  connect(actDelete_, &QAction::triggered, this, &MainWindow::onDeleteSelected);
 }
 
 void MainWindow::buildMenus() {
@@ -235,8 +264,15 @@ void MainWindow::buildMenus() {
   file->addAction(QStringLiteral("导出可视化 HTML..."), this, &MainWindow::onExportHtml);
   file->addAction(QStringLiteral("导出文本报告..."), this, &MainWindow::onExportReport);
   file->addAction(QStringLiteral("导出视图截图..."), this, &MainWindow::onExportShot);
-  file->addSeparator();
+file->addSeparator();
   file->addAction(QStringLiteral("退出"), this, &QWidget::close);
+
+  // ---- 编辑（T5 撤销/重做/删除）----
+  auto* edit = menuBar()->addMenu(QStringLiteral("编辑(&E)"));
+  edit->addAction(actUndo_);
+  edit->addAction(actRedo_);
+  edit->addSeparator();
+  edit->addAction(actDelete_);
 
   // ---- 视图 ----
   auto* view = menuBar()->addMenu(QStringLiteral("视图(&V)"));
@@ -648,8 +684,10 @@ bool MainWindow::openScript(const QString& path, bool runImmediately) {
     return false;
   }
 
-  clearResults();
+clearResults();
   model_ = std::move(m);
+  cmds_->clear();                    // 新模型：历史命令栈失效，全部清空
+  updateCmdState();
   scriptPath_ = path;
   scriptErrors_ = ms.errors();
   scriptWarnings_ = ms.warnings();
@@ -777,6 +815,8 @@ void MainWindow::gatherBuildNode(int node) {
 
 void MainWindow::commitBuild(const std::vector<Id>& ids, View3D::BuildTool t) {
   if (!model_) return;
+  // T5：操作前快照 —— 命令栈记录"这一次建模"的撤销节点
+  const Model before = model_->clone();
   // 默认属性：C30 混凝土 + 矩形截面（用户之后可在属性面板细调 ——
   // T3 已打通"改参即写回模型 + 自动重算"链路）。
   const Material mat = Material::concreteC(30);
@@ -835,7 +875,9 @@ void MainWindow::commitBuild(const std::vector<Id>& ids, View3D::BuildTool t) {
 
   if (r.ok) {
     log(QString::fromStdString(r.message));
+    cmds_->push(before, *model_);                  // T5：可撤销的模型变更
     refreshAfterBuild();
+    updateCmdState();
   } else {
     log(QStringLiteral("创建失败：%1").arg(QString::fromStdString(r.message)), true);
     statusBar()->showMessage(QStringLiteral("创建失败：") +
@@ -861,6 +903,79 @@ void MainWindow::onBuildBoxNodes(const std::vector<int>& nodes) {
 void MainWindow::onBuildEscaped() {
   pendingNodes_.clear();
   log(QStringLiteral("已退出创建工具"));
+}
+
+// =============================================================================
+//  T5 删除 + 撤销/重做
+//
+//  【快照式命令栈】所有模型变更（T4 创建、这里的删除）都以
+//  push(操作前, 操作后) 记录；撤销/重做只换 model_ 指针，不重放任何
+//  差分计算 —— 与"结果失效铁律③"天然一致：换完模型立即 refreshAfterBuild()。
+// =============================================================================
+void MainWindow::updateCmdState() {
+  if (!actUndo_ || !actRedo_) return;
+  actUndo_->setEnabled(cmds_ && cmds_->canUndo());
+  actRedo_->setEnabled(cmds_ && cmds_->canRedo());
+}
+
+void MainWindow::onDeleteSelected() {
+  if (!model_ || !view_) return;
+  const auto& sel = view_->selection();
+  const int selNode = view_->selectedNode();
+  if (sel.empty() && selNode < 0) return;
+
+  const Model before = model_->clone();
+  int removed = 0;
+
+  if (!sel.empty()) {
+    // removeElement 是"按序号删除、后续前移"：从大到小删，前移不误伤。
+    std::vector<int> ids(sel.begin(), sel.end());
+    std::sort(ids.rbegin(), ids.rend());
+    for (int id : ids) {
+      if (model_->removeElement(id)) {
+        ++removed;
+      } else {
+        log(QStringLiteral("删除失败：单元 #%1（越界或不可删除）").arg(id), true);
+      }
+    }
+  }
+  if (selNode >= 0) {
+    if (model_->removeNode(selNode)) {
+      ++removed;
+    } else {
+      log(QStringLiteral("删除失败：节点 #%1 仍被构件引用（先删除引用它的构件）")
+              .arg(selNode),
+          true);
+    }
+  }
+
+  if (removed > 0) {
+    cmds_->push(before, *model_);          // 记录一次可撤销的模型变更
+    view_->clearSelection();
+    log(QStringLiteral("已删除 %1 个对象（Ctrl+Z 可撤销）").arg(removed));
+    refreshAfterBuild();
+    updateCmdState();
+  } else {
+    statusBar()->showMessage(QStringLiteral("没有可删除的对象"), 3000);
+  }
+}
+
+void MainWindow::onUndo() {
+  if (!model_ || !cmds_ || !cmds_->canUndo()) return;
+  cmds_->undo(model_);
+  view_->clearSelection();
+  log(QStringLiteral("已撤销（剩余可撤销 %1 步）").arg(cmds_->undoDepth()));
+  refreshAfterBuild();                     // 结果失效 + 刷新视图/树 + 重算
+  updateCmdState();
+}
+
+void MainWindow::onRedo() {
+  if (!model_ || !cmds_ || !cmds_->canRedo()) return;
+  cmds_->redo(model_);
+  view_->clearSelection();
+  log(QStringLiteral("已重做（剩余可重做 %1 步）").arg(cmds_->redoDepth()));
+  refreshAfterBuild();
+  updateCmdState();
 }
 
 void MainWindow::onCheck() {

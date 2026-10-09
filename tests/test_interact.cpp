@@ -18,10 +18,12 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "yjk/interact/BuildOps.h"
+#include "yjk/interact/CommandStack.h"
 #include "yjk/io/ModelScript.h"
 #include "yjk/io/YjkWriter.h"
 #include "yjk/model/Model.h"
@@ -721,6 +723,156 @@ static void testBuildOps() {
   }
 }
 
+// =============================================================================
+//  7. T5 删除 + 撤销/重做（快照式命令栈）
+//
+//  验收：空模型 → 加柱 → 加梁 → 删柱 → 连续撤销回初始 → 连续重做回终点，
+//  每一步与"直接构建的独立模型"逐字段一致；栈深超限丢弃最老记录。
+// =============================================================================
+
+// 逐字段比对两个模型（节点坐标 / 层号 / 荷载，单元类型 / 节点引用 / 属性）
+static void checkModelEq(const Model& a, const Model& b, const char* what) {
+  char buf[128];
+  std::snprintf(buf, sizeof buf, "%s：节点数一致", what);
+  checkInt(a.nodeCount(), b.nodeCount(), buf);
+  std::snprintf(buf, sizeof buf, "%s：单元数一致", what);
+  checkInt(a.elementCount(), b.elementCount(), buf);
+  const Id nn = a.nodeCount() < b.nodeCount() ? a.nodeCount() : b.nodeCount();
+  for (Id n = 0; n < nn; ++n) {
+    std::snprintf(buf, sizeof buf, "%s：节点 %lld 坐标一致",
+                  what, static_cast<long long>(n));
+    checkVecNear(a.node(n).r, b.node(n).r, 1e-12, buf);
+    std::snprintf(buf, sizeof buf, "%s：节点 %lld 层号一致",
+                  what, static_cast<long long>(n));
+    checkInt(a.node(n).story, b.node(n).story, buf);
+    std::snprintf(buf, sizeof buf, "%s：节点 %lld 力一致",
+                  what, static_cast<long long>(n));
+    checkVecNear(a.node(n).force, b.node(n).force, 1e-12, buf);
+    std::snprintf(buf, sizeof buf, "%s：节点 %lld 力矩一致",
+                  what, static_cast<long long>(n));
+    checkVecNear(a.node(n).moment, b.node(n).moment, 1e-12, buf);
+  }
+  const Id ne = a.elementCount() < b.elementCount() ? a.elementCount()
+                                                    : b.elementCount();
+  for (Id k = 0; k < ne; ++k) {
+    const Element* sa = a.element(k);
+    const Element* sb = b.element(k);
+    std::snprintf(buf, sizeof buf, "%s：单元 %lld 类型一致",
+                  what, static_cast<long long>(k));
+    check(sb->type() == sa->type(), buf);
+    std::snprintf(buf, sizeof buf, "%s：单元 %lld 节点引用一致",
+                  what, static_cast<long long>(k));
+    check(sb->nodes() == sa->nodes(), buf);
+    if (sa->type() == ElementType::Beam3D) {
+      const auto* ba = static_cast<const BeamElement*>(sa);
+      const auto* bb = static_cast<const BeamElement*>(sb);
+      std::snprintf(buf, sizeof buf, "%s：单元 %lld up 一致",
+                    what, static_cast<long long>(k));
+      checkVecNear(bb->upHint(), ba->upHint(), 1e-12, buf);
+      std::snprintf(buf, sizeof buf, "%s：单元 %lld 截面 A 一致",
+                    what, static_cast<long long>(k));
+      checkNear(bb->section().A, ba->section().A, 1e-12, buf);
+      std::snprintf(buf, sizeof buf, "%s：单元 %lld 材料 E 一致",
+                    what, static_cast<long long>(k));
+      checkNear(bb->material().E, ba->material().E, 1e-12, buf);
+    } else if (sa->type() == ElementType::Shell4) {
+      const auto* xa = static_cast<const ShellElement*>(sa);
+      const auto* xb = static_cast<const ShellElement*>(sb);
+      std::snprintf(buf, sizeof buf, "%s：单元 %lld 墙标志一致",
+                    what, static_cast<long long>(k));
+      check(xb->isWall() == xa->isWall(), buf);
+      std::snprintf(buf, sizeof buf, "%s：单元 %lld 厚度一致",
+                    what, static_cast<long long>(k));
+      checkNear(xb->properties().thickness, xa->properties().thickness,
+                1e-12, buf);
+    }
+  }
+}
+
+static void testCommandStack() {
+  std::printf("\n== 7. T5 删除 + 撤销/重做（CommandStack）==\n");
+
+  const Material conc = Material::concreteC(30);
+  const SectionProperties sec = section::rect(0.3, 0.6);
+
+  // ---- 7a. 加→删→撤销→重做：每步与直接构建的模型逐字段一致 ----
+  interact::CommandStack cs(50);
+  auto cur = std::make_unique<Model>();          // 模拟 MainWindow::model_
+  const Model A = cur->clone();                  // 初始（空）
+
+  // 步 1：加柱
+  const Id n0 = cur->addNode(Vec3{0, 0, 0}, 0);
+  const Id n1 = cur->addNode(Vec3{0, 0, 3.6}, 1);
+  check(cur->addColumn(n0, n1, sec, conc) != nullptr, "步1：加柱成功");
+  const Model B = cur->clone();                  // 仅柱
+  cs.push(A, B);
+
+  // 步 2：加梁
+  const Id n2 = cur->addNode(Vec3{6, 0, 3.6}, 1);
+  check(cur->addBeam(n1, n2, sec, conc) != nullptr, "步2：加梁成功");
+  const Model C = cur->clone();                  // 柱 + 梁
+  cs.push(B, C);
+
+  // 步 3：删柱（第 0 个单元；removeElement 序号前移语义正由快照吸收）
+  check(cur->removeElement(0), "步3：删除柱单元");
+  const Model D = cur->clone();                  // 仅梁
+  cs.push(C, D);
+
+  checkInt(static_cast<long long>(cs.undoDepth()), 3, "撤销栈深 = 3");
+  check(cs.canUndo() && !cs.canRedo(), "可撤销、不可重做（新的变更清空重做栈）");
+
+  // 撤销三段 → C → B → A，每步逐字段一致
+  check(cs.undo(cur), "撤销 #1");
+  checkModelEq(*cur, C, "撤销#1 后 == 状态 C（柱+梁）");
+  check(cs.undo(cur), "撤销 #2");
+  checkModelEq(*cur, B, "撤销#2 后 == 状态 B（仅柱）");
+  check(cs.undo(cur), "撤销 #3");
+  checkModelEq(*cur, A, "撤销#3 后 == 初始空模型（逐字段一致）");
+  check(!cs.canUndo(), "全部撤销后不可再撤销");
+  checkInt(static_cast<long long>(cs.redoDepth()), 3, "重做栈深 = 3");
+
+  // 重做三段 → B → C → D，每步逐字段一致
+  check(cs.redo(cur), "重做 #1");
+  checkModelEq(*cur, B, "重做#1 后 == 状态 B");
+  check(cs.redo(cur), "重做 #2");
+  checkModelEq(*cur, C, "重做#2 后 == 状态 C");
+  check(cs.redo(cur), "重做 #3");
+  checkModelEq(*cur, D, "重做#3 后 == 状态 D（仅梁）");
+  check(!cs.canRedo(), "全部重做后不可再重做");
+
+  // 撤销后做新变更 → 重做栈被清空（分支被丢弃）
+  check(cs.undo(cur), "撤销一步（回到 C）");
+  const Model beforeNew = cur->clone();
+  cur->addNodeLoad(n1, Vec3{5, 0, -5});          // void：直接施加荷载
+  cs.push(beforeNew, *cur);
+  check(!cs.canRedo(), "新变更后重做栈清空（旧分支失效）");
+  check(cs.undo(cur), "撤销新变更");
+  checkModelEq(*cur, C, "撤销新变更后 == 状态 C");
+
+  // ---- 7b. 栈深限制：超限丢弃最老记录 ----
+  std::printf("  -- 栈深限制 --\n");
+  interact::CommandStack cs2(3);
+  auto cur2 = std::make_unique<Model>();
+  Model prev = cur2->clone();
+  for (int i = 0; i < 6; ++i) {
+    cur2->addNode(Vec3{static_cast<double>(i), 0, 0}, 0);
+    const Model now = cur2->clone();
+    cs2.push(prev, now);
+    prev = now.clone();                         // clone 返回右值：move 赋值
+  }
+  checkInt(static_cast<long long>(cs2.undoDepth()), 3,
+           "6 次变更 + maxDepth=3 → 栈深截断为 3");
+  // 最老 3 条被丢弃：连续撤销 3 次后应停在"第 3 次变更前"（3 节点）状态，
+  // 而非初始空模型 —— 证明第 0~2 条已被弹出。
+  check(cs2.undo(cur2), "栈深3：撤销 #1");
+  checkInt(cur2->nodeCount(), 5, "撤销#1 后 5 节点");
+  check(cs2.undo(cur2), "栈深3：撤销 #2");
+  checkInt(cur2->nodeCount(), 4, "撤销#2 后 4 节点");
+  check(cs2.undo(cur2), "栈深3：撤销 #3");
+  checkInt(cur2->nodeCount(), 3, "撤销#3 后回到 3 节点（最老记录已被丢弃）");
+  check(!cs2.canUndo(), "栈深3：无可再撤销（旧记录确实被丢弃）");
+}
+
 int main() {
   testMutableApi();
   testRoundTrip();
@@ -728,6 +880,7 @@ int main() {
   testClearRebuild();
   testPropertyEdit();
   testBuildOps();
+  testCommandStack();
 
   std::printf("\n====  test_interact：%d 通过，%d 失败 ====\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;

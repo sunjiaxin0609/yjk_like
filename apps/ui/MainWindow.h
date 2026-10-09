@@ -28,6 +28,7 @@
 #include "SceneData.h"
 #include "View3D.h"
 #include "yjk/analysis/StaticAnalysis.h"
+#include "yjk/interact/CommandStack.h"
 #include "yjk/io/ModelScript.h"
 #include "yjk/model/Model.h"
 #include "yjk/post/PostProcessor.h"
@@ -95,6 +96,12 @@ class MainWindow : public QMainWindow {
   void onBuildEscaped();                            // Esc 退出工具
   void onBuildToolChanged(View3D::BuildTool t);     // 同步 action 勾选态
 
+  // ---- T5 删除 + 撤销/重做 ----
+  void onDeleteSelected();                          // Delete 删除选中实体
+  void onUndo();                                    // Ctrl+Z
+  void onRedo();                                    // Ctrl+Y
+  void updateCmdState();                            // 同步撤销/重做使能态
+
  private:
   void buildActions();
   void buildMenus();
@@ -156,6 +163,12 @@ class MainWindow : public QMainWindow {
   QAction* actToolSlab_{nullptr};
   QAction* actToolLoad_{nullptr};
   QActionGroup* toolGroup_{nullptr};   // 工具互斥（可勾选组）
+
+  // ---- T5 命令栈（快照式撤销/重做，栈深默认 50）----
+  std::unique_ptr<yjk::interact::CommandStack> cmds_;
+  QAction* actUndo_{nullptr};
+  QAction* actRedo_{nullptr};
+  QAction* actDelete_{nullptr};
 
   // ---- 工具栏控件 ----
   QAction* actOpen_{nullptr};

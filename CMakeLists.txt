@@ -59,6 +59,7 @@ src/io/ModelScript.cpp
   src/io/YjkWriter.cpp
   src/interact/PickCore.cpp
   src/interact/BuildOps.cpp
+  src/interact/CommandStack.cpp
 )
 
 add_library(yjk_core STATIC ${YJK_CORE_SOURCES})
