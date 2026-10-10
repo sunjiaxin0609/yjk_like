@@ -53,8 +53,9 @@ src/analysis/StaticAnalysis.cpp
   src/analysis/ModalAnalysis.cpp
   src/analysis/ResponseSpectrum.cpp
   src/analysis/LoadCombination.cpp
-  src/post/PostProcessor.cpp
+src/post/PostProcessor.cpp
   src/post/ResultExport.cpp
+  src/check/RC.cpp
 src/io/ModelScript.cpp
   src/io/YjkWriter.cpp
   src/interact/PickCore.cpp
@@ -203,6 +204,13 @@ if(YJK_BUILD_TESTS)
   add_executable(test_pick tests/test_pick.cpp)
   target_link_libraries(test_pick PRIVATE yjk_core)
   add_test(NAME pick COMMAND test_pick)
+
+  # P4-T1 钢筋混凝土正截面承载力验算（GB 50010 §6.2/§6.4/§8.5.1）：
+  #   受弯（单筋/双筋）As 与 x 手算锚点、轴压 φ、偏心受压大/小判别、
+  #   纯扭/剪扭 Wt/ζ/βt/Tu/Vu，含超筋/少筋/最小配筋率与 ζ/βt 夹取边界。
+  add_executable(test_rc tests/test_rc.cpp)
+  target_link_libraries(test_rc PRIVATE yjk_core)
+  add_test(NAME rc COMMAND test_rc)
 endif()
 
 # ============================================================
