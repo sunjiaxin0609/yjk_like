@@ -7,12 +7,15 @@
 //    解析互逆 —— 本序列化器就是那条"出"的链路（ModelScript::parse+build
 //    是"进"的链路）。
 //
-//  【输出格式 = 原始构件命令】
-//  序列化产物只使用"原始构件命令"（node / beam / column / shell / wall /
+//  【输出格式 = 原始构件命令 + 单元级荷载 + 刚性楼板】
+//  序列化产物使用"原始构件命令"（node / beam / column / shell / wall /
 //  spring / fix / nodeload / nodemoment / nodeweight / material raw /
-//  section raw），不使用轴网命令 —— 轴网是生成式描述（几乘几跨几层），
-//  不能无损表达任意增删改后的模型；原始构件命令是"一份数据"，逐条列出
-//  每个节点/单元/荷载，读回后与源模型逐字段一致。
+//  section raw）以及单元级荷载/释放/楼板命令（release / beamsw /
+//  beamseg / beampoint / shellsw / shellp / diaphragm.bind），不用轴网
+//  命令 —— 轴网是生成式描述（几乘几跨几层），不能无损表达任意增删改后的
+//  模型；原始构件命令是"一份数据"，逐条列出每个节点/单元/荷载，读回后
+//  与源模型逐字段一致（T6 全量序列化：自重开关、线荷载段、等效节点荷载、
+//  端部释放、板面压/膜压、刚性楼板 DofLink 全部覆盖）。
 //
 //  编号语义：
 //  · 节点：按 addNode 顺序分配 id = 序号。序列化时跳过 retired 节点并
@@ -22,10 +25,11 @@
 //    BeamElement，序列化统一输出为 beam 命令并带显式 up —— 读回后单元
 //    类型/几何/截面/材料/up 与源模型逐字段一致（柱没有独立类型标志）。
 //  · 墙：ShellElement::isWall() 为 true 时输出 wall，否则输出 shell。
-//
-//  【未序列化的数据】（T6 全量序列化时补齐）
-//  · 刚性楼板（Diaphragm / DofLink）：约束属于分析装配的一部分，本轮
-//    T1 验收范围是"节点/单元/荷载集合"，round-trip 测试模型不建楼板。
+//  · 单元级荷载/释放序号 = elements() 中对应类型的出现计数（只数该类型，
+//    与 ModelScript `release beam <序号>` 的 seen 计数口径一致）。
+//  · 刚性楼板：主节点作为普通 node 输出（fixed[2..4] 以 fix 命令表达），
+//    每个 Diaphragm 输出一条 diaphragm.bind —— 读回后由
+//    Model::attachRigidDiaphragm 重建，DofLink 系数与源模型逐位一致。
 //
 //  【数字精度】所有 double 以 17 位有效数字输出，保证按位读回一致。
 // =============================================================================

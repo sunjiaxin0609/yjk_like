@@ -257,8 +257,10 @@ actContour_ = new QAction(QStringLiteral("显示云图"), this);
 void MainWindow::buildMenus() {
   // ---- 文件 ----
   auto* file = menuBar()->addMenu(QStringLiteral("文件(&F)"));
-  file->addAction(actOpen_);
+file->addAction(actOpen_);
   file->addAction(actReload_);
+  file->addAction(QStringLiteral("另存为 .yjk..."), this, &MainWindow::onSaveAsYjk);
+  file->addSeparator();
   file->addSeparator();
   file->addAction(QStringLiteral("导出结果 JSON..."), this, &MainWindow::onExportJson);
   file->addAction(QStringLiteral("导出可视化 HTML..."), this, &MainWindow::onExportHtml);
@@ -1252,6 +1254,32 @@ void MainWindow::setBusy(bool busy, const QString& what) {
   } else {
     QApplication::restoreOverrideCursor();
   }
+}
+
+// =============================================================================
+//  另存为 .yjk（T6：Model 全量序列化）
+// =============================================================================
+void MainWindow::onSaveAsYjk() {
+  if (!model_) {
+    QMessageBox::information(this, QStringLiteral("另存为 .yjk"),
+                             QStringLiteral("当前没有模型可保存。"));
+    return;
+  }
+  const QString path = QFileDialog::getSaveFileName(this, QStringLiteral("另存为 .yjk"),
+                                                    QStringLiteral("model.yjk"),
+                                                    QStringLiteral("YJK 脚本 (*.yjk)"));
+  if (path.isEmpty()) return;
+  const std::string text = yjk::io::modelToYjk(*model_);
+  QFile f(path);
+  if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+    QMessageBox::warning(this, QStringLiteral("保存失败"), f.errorString());
+    return;
+  }
+  QTextStream ts(&f);
+  ts.setEncoding(QStringConverter::Utf8);
+  ts << QString::fromStdString(text);
+  log(QStringLiteral("已另存为 .yjk：%1").arg(path));
+  statusBar()->showMessage(QStringLiteral("已保存 .yjk"), 3000);
 }
 
 // =============================================================================

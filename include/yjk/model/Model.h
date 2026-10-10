@@ -397,8 +397,10 @@ void equivalentLoads(std::vector<double>& f) const override {
     f[8] = f[11] = 0.5 * F.z;
     appendPt(f);
   }
-  bool hasPointLoad() const { return !pt_.empty(); }
+bool hasPointLoad() const { return !pt_.empty(); }
   const std::vector<double>& pointLoads() const { return pt_; }
+  // T6 全量序列化：等效节点集中力（12 个值）原样写回，与读取互逆。
+  void setPointLoads(const std::vector<double>& v) { pt_ = v; }
 
  private:
   void appendPt(const Vec12d& f) { pt_.insert(pt_.end(), f.begin(), f.end()); }
@@ -505,6 +507,10 @@ void equivalentLoads(std::vector<double>& f) const override {
 
 void setTransversePressure(double p) { pz_ = p; }
   void setMembranePressure(double px, double py) { px_ = px; py_ = py; }
+  // T6 全量序列化：单元荷载读回（与 set 互逆）
+  double transversePressure() const { return pz_; }
+  double membranePressureX() const { return px_; }
+  double membranePressureY() const { return py_; }
   double area() const { return sh_.area(); }
   bool plateReady() const;
 
@@ -800,6 +806,14 @@ std::vector<std::unique_ptr<Element>>& elements() { return elems_; }
   //  几个平移量的数值），所以取形心是安全的、也是唯一与用户直觉一致的选择。
   //  主节点只有 (ux, uy, rz) 三个自由度参与求解，其余三个直接约束掉。
   Id addRigidDiaphragm(const std::vector<Id>& nodes, int story, bool coupleRz = true);
+
+  // T6 全量序列化：把一组节点绑到【已存在的主节点】上，重建刚性楼板。
+  //
+  //  与 addRigidDiaphragm 的区别：它不新建主节点 —— 主节点在序列化文本里
+  //  就是普通 node（带坐标与固定约束），读回后由本接口把该节点升级为主节点
+  //  并重建 DofLink。参考点取主节点坐标（= 原形心），links 系数与源一致。
+  Id attachRigidDiaphragm(Id master, const std::vector<Id>& slaves,
+                          int story, bool coupleRz = true);
 
   const std::vector<DofLink>& dofLinks() const { return links_; }
   const std::vector<Diaphragm>& diaphragms() const { return diaphragms_; }

@@ -331,8 +331,52 @@ Id Model::addRigidDiaphragm(const std::vector<Id>& ns, int story, bool coupleRz)
       links_.push_back(DofLink{b + 5, {{mBase + 5, 1.0}}});
   }
 
-  diaphragms_.push_back(D);
+diaphragms_.push_back(D);
   return mid;
+}
+
+// T6 全量序列化：绑定已存在的主节点（读回序列化文本时用）。
+// 与 addRigidDiaphragm 的区别仅在于不新建主节点 —— 节点集合、
+// 约束集与 DofLink 系数与源模型完全一致（参考点取主节点坐标）。
+Id Model::attachRigidDiaphragm(Id master, const std::vector<Id>& ns,
+                               int story, bool coupleRz) {
+  if (master < 0 || master >= nodeCount()) return kDofFixed;
+  if (nodes_[static_cast<size_t>(master)].retired) return kDofFixed;
+
+  Diaphragm D;
+  D.story = story;
+  D.coupleRz = coupleRz;
+
+  // 参考点 = 主节点坐标。序列化时主节点按普通 node 输出（坐标 = 原形心），
+  // 读回后坐标不变，故 dx/dy 及 links 系数与源模型逐位一致。
+  const Node& mn = nodes_[static_cast<size_t>(master)];
+  const Vec3 c = mn.r;
+  D.center = c;
+  D.masterNode = master;
+
+  Node& mw = nodes_[static_cast<size_t>(master)];
+  mw.diaphragmMaster = true;
+  mw.fixed[2] = true;      // uz：面外刚度不由刚性楼板假定提供
+  mw.fixed[3] = true;      // rx
+  mw.fixed[4] = true;      // ry
+
+  const Id mBase = master * 6;
+  for (Id n : ns) {
+    if (n < 0 || n >= nodeCount() || n == master) continue;
+    if (nodes_[static_cast<size_t>(n)].retired) continue;
+    const Node& nd = nodes_[static_cast<size_t>(n)];
+    const double dx = nd.r.x - c.x;
+    const double dy = nd.r.y - c.y;
+    const Id b = n * 6;
+    D.slaves.push_back(n);
+    links_.push_back(DofLink{b + 0, {{mBase + 0, 1.0}, {mBase + 5, -dy}}});
+    links_.push_back(DofLink{b + 1, {{mBase + 1, 1.0}, {mBase + 5, dx}}});
+    if (coupleRz)
+      links_.push_back(DofLink{b + 5, {{mBase + 5, 1.0}}});
+  }
+
+  diaphragms_.push_back(D);
+  return master;
 }
 
 void Model::clearLoads() {

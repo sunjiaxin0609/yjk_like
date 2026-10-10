@@ -575,6 +575,164 @@ bool ModelScript::build(Model& m, std::string* info) {
       continue;
     }
 
+    // ---------------- 单元级荷载 / 释放（T6 全量序列化） ----------------
+    // 序号 = 该类单元在 elements() 中的计数（与 `release beam <序号>` 的
+    // seen 计数口径一致：只数对应类型，跳过其他单元）。必须出现在
+    // 单元命令之后（序列化文本天然满足：单元块 → 荷载块 → 约束块）。
+    if (c.name == "beamsw") {
+      // beamsw <序号> <0|1> —— 该梁的自重开关
+      if (!need(c, 2)) continue;
+      int id = 0;
+      if (!toInt(a[0], id) || id < 0) { errors_.push_back("第 " + std::to_string(c.line) +
+                                        " 行：梁序号 '" + a[0] + "' 不是非负整数"); continue; }
+      const std::string v = lower(a[1]);
+      if (v != "0" && v != "1" && v != "on" && v != "off" && v != "true" && v != "false") {
+        errors_.push_back("第 " + std::to_string(c.line) +
+                          " 行：beamsw 参数应为 0/1"); continue;
+      }
+      const bool on = (v == "1" || v == "on" || v == "true");
+      int seen = 0;
+      bool hit = false;
+      for (auto& e : m.elements()) {
+        if (e->type() != ElementType::Beam3D) continue;
+        if (seen++ != id) continue;
+        static_cast<BeamElement*>(e.get())->setSelfWeight(on);
+        hit = true;
+        break;
+      }
+      if (!hit) errors_.push_back("第 " + std::to_string(c.line) +
+                                  " 行：梁序号 " + a[0] + " 越界（梁单元共 " +
+                                  std::to_string(seen) + " 根）");
+      continue;
+    }
+    if (c.name == "beamseg") {
+      // beamseg <序号> <x1> <x2> <q1x q1y q1z q2x q2y q2z>
+      if (!need(c, 9)) continue;
+      int id = 0;
+      if (!toInt(a[0], id) || id < 0) { errors_.push_back("第 " + std::to_string(c.line) +
+                                        " 行：梁序号 '" + a[0] + "' 不是非负整数"); continue; }
+      double v[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+      bool ok = true;
+      for (int i = 0; i < 8; ++i) {
+        if (!toNum(a[static_cast<size_t>(i + 1)], v[static_cast<size_t>(i)])) {
+          errors_.push_back("第 " + std::to_string(c.line) + " 行：beamseg 参数 '" +
+                            a[static_cast<size_t>(i + 1)] + "' 不是合法数值");
+          ok = false;
+        }
+      }
+      if (!ok) continue;
+      int seen = 0;
+      bool hit = false;
+      for (auto& e : m.elements()) {
+        if (e->type() != ElementType::Beam3D) continue;
+        if (seen++ != id) continue;
+        static_cast<BeamElement*>(e.get())->addLineLoadSegment(
+            v[0], v[1], Vec3{v[2], v[3], v[4]}, Vec3{v[5], v[6], v[7]});
+        hit = true;
+        break;
+      }
+      if (!hit) errors_.push_back("第 " + std::to_string(c.line) +
+                                  " 行：梁序号 " + a[0] + " 越界（梁单元共 " +
+                                  std::to_string(seen) + " 根）");
+      continue;
+    }
+    if (c.name == "beampoint") {
+      // beampoint <序号> <12 个等效节点荷载值>
+      if (!need(c, 13)) continue;
+      int id = 0;
+      if (!toInt(a[0], id) || id < 0) { errors_.push_back("第 " + std::to_string(c.line) +
+                                        " 行：梁序号 '" + a[0] + "' 不是非负整数"); continue; }
+      std::vector<double> pt;
+      pt.reserve(12);
+      bool ok = true;
+      for (int i = 0; i < 12; ++i) {
+        double x = 0;
+        if (!toNum(a[static_cast<size_t>(i + 1)], x)) {
+          errors_.push_back("第 " + std::to_string(c.line) + " 行：beampoint 分量 '" +
+                            a[static_cast<size_t>(i + 1)] + "' 不是合法数值");
+          ok = false;
+        }
+        pt.push_back(x);
+      }
+      if (!ok) continue;
+      int seen = 0;
+      bool hit = false;
+      for (auto& e : m.elements()) {
+        if (e->type() != ElementType::Beam3D) continue;
+        if (seen++ != id) continue;
+        static_cast<BeamElement*>(e.get())->setPointLoads(pt);
+        hit = true;
+        break;
+      }
+      if (!hit) errors_.push_back("第 " + std::to_string(c.line) +
+                                  " 行：梁序号 " + a[0] + " 越界（梁单元共 " +
+                                  std::to_string(seen) + " 根）");
+      continue;
+    }
+    if (c.name == "shellsw") {
+      // shellsw <序号> <0|1> —— 该壳（含墙）的自重开关
+      if (!need(c, 2)) continue;
+      int id = 0;
+      if (!toInt(a[0], id) || id < 0) { errors_.push_back("第 " + std::to_string(c.line) +
+                                        " 行：壳序号 '" + a[0] + "' 不是非负整数"); continue; }
+      const std::string v = lower(a[1]);
+      if (v != "0" && v != "1" && v != "on" && v != "off" && v != "true" && v != "false") {
+        errors_.push_back("第 " + std::to_string(c.line) +
+                          " 行：shellsw 参数应为 0/1"); continue;
+      }
+      const bool on = (v == "1" || v == "on" || v == "true");
+      int seen = 0;
+      bool hit = false;
+      for (auto& e : m.elements()) {
+        if (e->type() != ElementType::Shell4) continue;
+        if (seen++ != id) continue;
+        static_cast<ShellElement*>(e.get())->setSelfWeight(on);
+        hit = true;
+        break;
+      }
+      if (!hit) errors_.push_back("第 " + std::to_string(c.line) +
+                                  " 行：壳序号 " + a[0] + " 越界（壳单元共 " +
+                                  std::to_string(seen) + " 个）");
+      continue;
+    }
+    if (c.name == "shellp") {
+      // shellp <序号> <pz> [px py] —— 板面压（kPa，单元内存储值）与膜压
+      // 注意：pz 直接写入单元（不做工程正负号转换）—— 序列化输出的是
+      // 单元内存储的原值，与 YjkWriter 输出互逆。
+      if (!need(c, 2)) continue;
+      int id = 0;
+      if (!toInt(a[0], id) || id < 0) { errors_.push_back("第 " + std::to_string(c.line) +
+                                        " 行：壳序号 '" + a[0] + "' 不是非负整数"); continue; }
+      double pz = 0, px = 0, py = 0;
+      if (!toNum(a[1], pz)) {
+        errors_.push_back("第 " + std::to_string(c.line) + " 行：面压 '" + a[1] +
+                          "' 不是合法数值"); continue;
+      }
+      if (a.size() >= 3 && !toNum(a[2], px)) {
+        errors_.push_back("第 " + std::to_string(c.line) + " 行：膜压 px '" + a[2] +
+                          "' 不是合法数值"); continue;
+      }
+      if (a.size() >= 4 && !toNum(a[3], py)) {
+        errors_.push_back("第 " + std::to_string(c.line) + " 行：膜压 py '" + a[3] +
+                          "' 不是合法数值"); continue;
+      }
+      int seen = 0;
+      bool hit = false;
+      for (auto& e : m.elements()) {
+        if (e->type() != ElementType::Shell4) continue;
+        if (seen++ != id) continue;
+        ShellElement* s = static_cast<ShellElement*>(e.get());
+        s->setTransversePressure(pz);
+        if (a.size() >= 3) s->setMembranePressure(px, py);
+        hit = true;
+        break;
+      }
+      if (!hit) errors_.push_back("第 " + std::to_string(c.line) +
+                                  " 行：壳序号 " + a[0] + " 越界（壳单元共 " +
+                                  std::to_string(seen) + " 个）");
+      continue;
+    }
+
     // ---------------- 轴网 ----------------
     if (c.name == "grid.axisx") {
       for (const auto& s : a) {
@@ -749,6 +907,48 @@ bool ModelScript::build(Model& m, std::string* info) {
       }
       const Id made = mesh_->addRigidDiaphragms(m, static_cast<Id>(std::max(0, from)), true);
       if (info) *info += "；刚性楼板 " + std::to_string(made) + " 层";
+      continue;
+    }
+    if (c.name == "diaphragm.bind") {
+      // diaphragm.bind <story> <coupleRz 0/1> <masterId> <slaveIds...>
+      // 把 slave 节点绑到【已存在】的主节点上（T6 全量序列化读回路径）。
+      // 与 `diaphragm on` 的区别：不新建主节点、不依赖网格 ——
+      // 主节点在序列化文本里就是普通 node（带固定约束），由本命令
+      // 把它升级为主节点并重建 DofLink（系数与源模型逐位一致）。
+      if (!need(c, 4)) continue;
+      int story = 0;
+      if (!toInt(a[0], story)) { errors_.push_back("第 " + std::to_string(c.line) +
+                                 " 行：层号 '" + a[0] + "' 不是整数"); continue; }
+      const std::string cr = lower(a[1]);
+      if (cr != "0" && cr != "1" && cr != "on" && cr != "off" &&
+          cr != "true" && cr != "false") {
+        errors_.push_back("第 " + std::to_string(c.line) +
+                          " 行：coupleRz 应为 0/1"); continue;
+      }
+      const bool coupleRz = (cr == "1" || cr == "on" || cr == "true");
+      int mid = 0;
+      if (!toInt(a[2], mid) || mid < 0 || mid >= m.nodeCount()) {
+        errors_.push_back("第 " + std::to_string(c.line) + " 行：主节点号 '" + a[2] +
+                          "' 越界（当前节点 0.." + std::to_string(m.nodeCount() - 1) + "）");
+        continue;
+      }
+      std::vector<Id> slaves;
+      bool ok = true;
+      for (size_t i = 3; i < a.size(); ++i) {
+        int v = 0;
+        if (!toInt(a[i], v) || v < 0 || v >= m.nodeCount()) {
+          errors_.push_back("第 " + std::to_string(c.line) + " 行：从属节点号 '" + a[i] +
+                            "' 越界（当前节点 0.." + std::to_string(m.nodeCount() - 1) + "）");
+          ok = false;
+        } else {
+          slaves.push_back(static_cast<Id>(v));
+        }
+      }
+      if (!ok) continue;
+      const Id made = m.attachRigidDiaphragm(static_cast<Id>(mid), slaves, story, coupleRz);
+      if (made == kDofFixed) errors_.push_back("第 " + std::to_string(c.line) +
+                                  " 行：diaphragm.bind 主节点 " + a[2] + " 无效");
+      else if (info) *info += "；刚性楼板绑定 " + std::to_string(slaves.size()) + " 节点";
       continue;
     }
     if (c.name == "grid.nocolumn" || c.name == "grid.nobeamx" ||

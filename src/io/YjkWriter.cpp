@@ -1,8 +1,9 @@
 // =============================================================================
-//  src/io/YjkWriter.cpp  ——  Model → .yjk 脚本文本序列化
+//  src/io/YjkWriter.cpp  ——  Model → .yjk 脚本文本序列化（T6 全量）
 // =============================================================================
 #include "yjk/io/YjkWriter.h"
 
+#include <algorithm>
 #include <iomanip>
 #include <map>
 #include <sstream>
@@ -52,6 +53,26 @@ SecKey secKey(const SectionProperties& s) {
 }
 
 const char* boolStr(bool b) { return b ? "1" : "0"; }
+
+// 释放分量名（与 ModelScript `release beam` 的分量名一一对应）
+const char* compName(int k) {
+  static const char* names[6] = {"ux", "uy", "uz", "rx", "ry", "rz"};
+  return names[k];
+}
+
+// 读出某端已释放的分量，输出为 release 命令片段
+void emitReleases(std::ostringstream& os, const BeamElement* b, int beamSeq) {
+  if (!b->hasReleases()) return;
+  std::string iComps, jComps;
+  for (int k = 0; k < 6; ++k) {
+    if (b->isReleased(0, k)) { if (iComps.empty()) iComps = " "; iComps += compName(k); }
+    if (b->isReleased(1, k)) { if (jComps.empty()) jComps = " "; jComps += compName(k); }
+  }
+  if (!iComps.empty())
+    os << "release beam " << beamSeq << " i" << iComps << "\n";
+  if (!jComps.empty())
+    os << "release beam " << beamSeq << " j" << jComps << "\n";
+}
 
 }  // namespace
 
@@ -140,7 +161,26 @@ std::string modelToYjk(const Model& m) {
        << " " << nd.story << "\n";
   }
 
-  // ---- 单元 ----
+  // ---- 单元 + 备份单元引用（供荷载命令定位序号）----
+  // 单元序号 = elements() 下标（与 release beam <序号> 的计数口径一致：
+  // 序号只数 Beam，见 ModelScript::build）。auto 引用在写单元主体的循环
+  // 中会 invalidate（vector 重分配），所以先收集到局部容器。
+  std::vector<const BeamElement*> beams;
+  std::vector<const ShellElement*> shells;
+  for (const auto& e : m.elements()) {
+    switch (e->type()) {
+      case ElementType::Beam3D:
+        beams.push_back(static_cast<const BeamElement*>(e.get()));
+        break;
+      case ElementType::Shell4:
+        shells.push_back(static_cast<const ShellElement*>(e.get()));
+        break;
+      default:
+        break;
+    }
+  }
+
+  // 主体输出
   for (const auto& e : m.elements()) {
     std::vector<std::string> ns;
     for (Id nid : e->nodes())
@@ -178,6 +218,38 @@ std::string modelToYjk(const Model& m) {
     }
   }
 
+  // ---- 单元级荷载与端部释放（T6 全量）----
+  // 每个 beam/shell 在 elements() 流中的序号（只数对应类型，与
+  // ModelScript `release beam <序号>` 的 seen 计数口径一致）。
+  {
+    int beamSeq = 0;
+    for (const BeamElement* b : beams) {
+      emitReleases(os, b, beamSeq);
+      if (b->selfWeight())
+        os << "beamsw " << beamSeq << " 1\n";
+      for (const auto& sg : b->loadSegments())
+        os << "beamseg " << beamSeq << " " << sg.x1 << " " << sg.x2 << " "
+           << sg.q1.x << " " << sg.q1.y << " " << sg.q1.z << " "
+           << sg.q2.x << " " << sg.q2.y << " " << sg.q2.z << "\n";
+      if (b->hasPointLoad()) {
+        os << "beampoint " << beamSeq;
+        for (double v : b->pointLoads()) os << " " << v;
+        os << "\n";
+      }
+      ++beamSeq;
+    }
+    int shellSeq = 0;
+    for (const ShellElement* s : shells) {
+      if (s->selfWeight())
+        os << "shellsw " << shellSeq << " 1\n";
+      if (s->transversePressure() != 0.0 || s->membranePressureX() != 0.0 ||
+          s->membranePressureY() != 0.0)
+        os << "shellp " << shellSeq << " " << s->transversePressure() << " "
+           << s->membranePressureX() << " " << s->membranePressureY() << "\n";
+      ++shellSeq;
+    }
+  }
+
   // ---- 约束 ----
   for (Id n = 0; n < m.nodeCount(); ++n) {
     if (m.node(n).retired) continue;
@@ -203,6 +275,18 @@ std::string modelToYjk(const Model& m) {
          << " " << nd.moment.z << "\n";
     if (nd.weight != 0.0)
       os << "nodeweight node " << rn << " " << nd.weight << "\n";
+  }
+
+  // ---- 刚性楼板（T6 全量）----
+  // 主节点已作为普通 node 输出；这里用 diaphragm.bind 绑定既有主节点并
+  // 重建 DofLink（与 ModelScript 的 diaphragm.bind 命令一一对应，
+  // 需在全部 node 命令之后执行）。
+  for (const auto& d : m.diaphragms()) {
+    os << "diaphragm.bind " << d.story << " " << boolStr(d.coupleRz) << " "
+       << remap[static_cast<size_t>(d.masterNode)];
+    for (Id s : d.slaves)
+      os << " " << remap[static_cast<size_t>(s)];
+    os << "\n";
   }
 
   return os.str();

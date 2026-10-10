@@ -37,6 +37,23 @@
 //    nodeweight node <id> <w>                   节点附加重量（建模属性，
 //                                                 not 工况荷载，不分 case）
 //
+//  —— 单元级荷载 / 释放 / 刚性楼板（T6 全量序列化，序号=该类单元在
+//  elements() 中的计数，与 `release beam <序号>` 口径一致）——
+//    release    beam <序号> <i|j> <分量...>     端部释放（见上）
+//    beamsw     <序号> <0|1>                    该梁的自重开关
+//    beamseg    <序号> <x1> <x2> <q1x q1y q1z q2x q2y q2z>
+//                                               追加一个线荷载段（局部 x 区间，
+//                                               两端全局分量 kN/m）
+//    beampoint  <序号> <12 个值>                等效节点集中荷载（原样写回）
+//    shellsw    <序号> <0|1>                    该壳（含墙）的自重开关
+//    shellp     <序号> <pz> <px> <py>           板面压（kPa，单元内存储值，
+//                                               -z 为向下）与膜压
+//    diaphragm.bind <story> <coupleRz 0/1> <masterId> <slaveIds...>
+//                                               把 slave 节点绑到已存在的主节点
+//                                               （与 `diaphragm on` 的网格生成式
+//                                               不同：它是逐条重建刚性楼板，
+//                                               供 .yjk 全量序列化读回）
+//
 //    grid.axisX   <y...>                    X 向轴线的 y 坐标
 //    grid.axisY   <x...>                    Y 向轴线的 x 坐标
 //    grid.story   <z...>                    楼面标高（第一个为基底）

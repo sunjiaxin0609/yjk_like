@@ -30,6 +30,7 @@
 #include "yjk/analysis/StaticAnalysis.h"
 #include "yjk/interact/CommandStack.h"
 #include "yjk/io/ModelScript.h"
+#include "yjk/io/YjkWriter.h"
 #include "yjk/model/Model.h"
 #include "yjk/post/PostProcessor.h"
 
@@ -86,6 +87,7 @@ class MainWindow : public QMainWindow {
   void onExportHtml();
   void onExportReport();
   void onExportShot();
+  void onSaveAsYjk();
   void onAbout();
   void onViewOptionsChanged();
 

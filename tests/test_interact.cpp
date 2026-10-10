@@ -18,7 +18,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -724,11 +726,287 @@ static void testBuildOps() {
 }
 
 // =============================================================================
-//  7. T5 删除 + 撤销/重做（快照式命令栈）
+//  8. T6 全量序列化 round-trip（另存为 .yjk）
 //
-//  验收：空模型 → 加柱 → 加梁 → 删柱 → 连续撤销回初始 → 连续重做回终点，
-//  每一步与"直接构建的独立模型"逐字段一致；栈深超限丢弃最老记录。
+//  验收：读 examples/frame_wall.yjk → build → 加构件 → modelToYjk() 导出
+//  → ModelScript 读回 → 与源模型逐字段一致：
+//    · 节点：坐标 / 层号 / 力 / 力矩 / weight / fixed
+//    · 单元：类型 / 节点 / up / 截面 / 材料 / 自重开关 / 线荷载段 /
+//            等效节点荷载 / 端部释放 / 墙标志 / 厚度 / pz_ / px_ / py_
+//    · 刚性楼板：diaphragms() 拓扑 + DofLink 系数
 // =============================================================================
+
+static void checkT6ModelEq(const Model& a, const Model& b, const char* what) {
+  char buf[160];
+  std::snprintf(buf, sizeof buf, "%s：节点数一致", what);
+  checkInt(a.nodeCount(), b.nodeCount(), buf);
+  std::snprintf(buf, sizeof buf, "%s：单元数一致", what);
+  checkInt(a.elementCount(), b.elementCount(), buf);
+  const Id nn = a.nodeCount() < b.nodeCount() ? a.nodeCount() : b.nodeCount();
+  for (Id n = 0; n < nn; ++n) {
+    const Node& na = a.node(n);
+    const Node& nb = b.node(n);
+    std::snprintf(buf, sizeof buf, "%s：节点 %lld 坐标一致",
+                  what, static_cast<long long>(n));
+    checkVecNear(nb.r, na.r, 1e-12, buf);
+    std::snprintf(buf, sizeof buf, "%s：节点 %lld 层号一致",
+                  what, static_cast<long long>(n));
+    checkInt(nb.story, na.story, buf);
+    std::snprintf(buf, sizeof buf, "%s：节点 %lld 力一致",
+                  what, static_cast<long long>(n));
+    checkVecNear(nb.force, na.force, 1e-12, buf);
+    std::snprintf(buf, sizeof buf, "%s：节点 %lld 力矩一致",
+                  what, static_cast<long long>(n));
+    checkVecNear(nb.moment, na.moment, 1e-12, buf);
+    std::snprintf(buf, sizeof buf, "%s：节点 %lld weight 一致",
+                  what, static_cast<long long>(n));
+    checkNear(nb.weight, na.weight, 1e-12, buf);
+    for (int k = 0; k < 6; ++k) {
+      std::snprintf(buf, sizeof buf, "%s：节点 %lld fixed[%d] 一致",
+                    what, static_cast<long long>(n), k);
+      check(nb.fixed[k] == na.fixed[k], buf);
+    }
+  }
+  const Id ne = a.elementCount() < b.elementCount() ? a.elementCount()
+                                                    : b.elementCount();
+  for (Id k = 0; k < ne; ++k) {
+    const Element* ea = a.element(k);
+    const Element* eb = b.element(k);
+    std::snprintf(buf, sizeof buf, "%s：单元 %lld 类型一致",
+                  what, static_cast<long long>(k));
+    check(eb->type() == ea->type(), buf);
+    std::snprintf(buf, sizeof buf, "%s：单元 %lld 节点引用一致",
+                  what, static_cast<long long>(k));
+    check(eb->nodes() == ea->nodes(), buf);
+    if (ea->type() == ElementType::Beam3D) {
+      const auto* ba = static_cast<const BeamElement*>(ea);
+      const auto* bb = static_cast<const BeamElement*>(eb);
+      std::snprintf(buf, sizeof buf, "%s：单元 %lld up 一致",
+                    what, static_cast<long long>(k));
+      checkVecNear(bb->upHint(), ba->upHint(), 1e-12, buf);
+      std::snprintf(buf, sizeof buf, "%s：单元 %lld 截面 A 一致",
+                    what, static_cast<long long>(k));
+      checkNear(bb->section().A, ba->section().A, 1e-12, buf);
+      std::snprintf(buf, sizeof buf, "%s：单元 %lld 材料 E 一致",
+                    what, static_cast<long long>(k));
+      checkNear(bb->material().E, ba->material().E, 1e-12, buf);
+      std::snprintf(buf, sizeof buf, "%s：单元 %lld 自重开关一致",
+                    what, static_cast<long long>(k));
+      check(bb->selfWeight() == ba->selfWeight(), buf);
+      std::snprintf(buf, sizeof buf, "%s：单元 %lld 线荷载段数一致",
+                    what, static_cast<long long>(k));
+      checkInt(static_cast<long long>(bb->loadSegments().size()),
+               static_cast<long long>(ba->loadSegments().size()), buf);
+      const size_t ns = ba->loadSegments().size() < bb->loadSegments().size()
+                            ? ba->loadSegments().size()
+                            : bb->loadSegments().size();
+      for (size_t s = 0; s < ns; ++s) {
+        std::snprintf(buf, sizeof buf, "%s：单元 %lld 段 %zu x1 一致",
+                      what, static_cast<long long>(k), s);
+        checkNear(bb->loadSegments()[s].x1, ba->loadSegments()[s].x1, 1e-12, buf);
+        std::snprintf(buf, sizeof buf, "%s：单元 %lld 段 %zu x2 一致",
+                      what, static_cast<long long>(k), s);
+        checkNear(bb->loadSegments()[s].x2, ba->loadSegments()[s].x2, 1e-12, buf);
+        std::snprintf(buf, sizeof buf, "%s：单元 %lld 段 %zu q1 一致",
+                      what, static_cast<long long>(k), s);
+        checkVecNear(bb->loadSegments()[s].q1, ba->loadSegments()[s].q1, 1e-12,
+                     buf);
+        std::snprintf(buf, sizeof buf, "%s：单元 %lld 段 %zu q2 一致",
+                      what, static_cast<long long>(k), s);
+        checkVecNear(bb->loadSegments()[s].q2, ba->loadSegments()[s].q2, 1e-12,
+                     buf);
+      }
+      std::snprintf(buf, sizeof buf, "%s：单元 %lld 集中荷载一致",
+                    what, static_cast<long long>(k));
+      check(bb->pointLoads() == ba->pointLoads(), buf);
+      std::snprintf(buf, sizeof buf, "%s：单元 %lld 释放标志一致",
+                    what, static_cast<long long>(k));
+      check(bb->hasReleases() == ba->hasReleases(), buf);
+      if (ba->hasReleases())
+        for (int en = 0; en < 2; ++en)
+          for (int c = 0; c < 6; ++c) {
+            std::snprintf(buf, sizeof buf, "%s：单元 %lld 端 %d 分量 %d 释放一致",
+                          what, static_cast<long long>(k), en, c);
+            check(bb->isReleased(en, c) == ba->isReleased(en, c), buf);
+          }
+    } else if (ea->type() == ElementType::Shell4) {
+      const auto* xa = static_cast<const ShellElement*>(ea);
+      const auto* xb = static_cast<const ShellElement*>(eb);
+      std::snprintf(buf, sizeof buf, "%s：单元 %lld 墙标志一致",
+                    what, static_cast<long long>(k));
+      check(xb->isWall() == xa->isWall(), buf);
+      std::snprintf(buf, sizeof buf, "%s：单元 %lld 厚度一致",
+                    what, static_cast<long long>(k));
+      checkNear(xb->properties().thickness, xa->properties().thickness,
+                1e-12, buf);
+      std::snprintf(buf, sizeof buf, "%s：单元 %lld 自重开关一致",
+                    what, static_cast<long long>(k));
+      check(xb->selfWeight() == xa->selfWeight(), buf);
+      std::snprintf(buf, sizeof buf, "%s：单元 %lld pz（面压）一致",
+                    what, static_cast<long long>(k));
+      checkNear(xb->transversePressure(), xa->transversePressure(), 1e-12, buf);
+      std::snprintf(buf, sizeof buf, "%s：单元 %lld px（膜压）一致",
+                    what, static_cast<long long>(k));
+      checkNear(xb->membranePressureX(), xa->membranePressureX(), 1e-12, buf);
+      std::snprintf(buf, sizeof buf, "%s：单元 %lld py（膜压）一致",
+                    what, static_cast<long long>(k));
+      checkNear(xb->membranePressureY(), xa->membranePressureY(), 1e-12, buf);
+    }
+  }
+
+  // 刚性楼板：拓扑 + DofLink 系数
+  const auto& da = a.diaphragms();
+  const auto& db = b.diaphragms();
+  std::snprintf(buf, sizeof buf, "%s：刚性楼板数一致", what);
+  checkInt(static_cast<long long>(db.size()),
+           static_cast<long long>(da.size()), buf);
+  const size_t nd = da.size() < db.size() ? da.size() : db.size();
+  for (size_t d = 0; d < nd; ++d) {
+    std::snprintf(buf, sizeof buf, "%s：楼板 %zu 层号一致", what, d);
+    checkInt(db[d].story, da[d].story, buf);
+    std::snprintf(buf, sizeof buf, "%s：楼板 %zu coupleRz 一致", what, d);
+    check(db[d].coupleRz == da[d].coupleRz, buf);
+    std::snprintf(buf, sizeof buf, "%s：楼板 %zu 主节点一致", what, d);
+    checkInt(db[d].masterNode, da[d].masterNode, buf);
+    std::snprintf(buf, sizeof buf, "%s：楼板 %zu slave 数一致", what, d);
+    checkInt(static_cast<long long>(db[d].slaves.size()),
+             static_cast<long long>(da[d].slaves.size()), buf);
+    const size_t nsl = da[d].slaves.size() < db[d].slaves.size()
+                           ? da[d].slaves.size()
+                           : db[d].slaves.size();
+    for (size_t s = 0; s < nsl; ++s) {
+      std::snprintf(buf, sizeof buf, "%s：楼板 %zu slave %zu 一致", what, d, s);
+      checkInt(db[d].slaves[s], da[d].slaves[s], buf);
+    }
+  }
+  const auto& la = a.dofLinks();
+  const auto& lb = b.dofLinks();
+  std::snprintf(buf, sizeof buf, "%s：DofLink 数一致", what);
+  checkInt(static_cast<long long>(lb.size()),
+           static_cast<long long>(la.size()), buf);
+  const size_t nl = la.size() < lb.size() ? la.size() : lb.size();
+  for (size_t l = 0; l < nl; ++l) {
+    std::snprintf(buf, sizeof buf, "%s：DofLink %zu slave 一致", what, l);
+    checkInt(lb[l].slave, la[l].slave, buf);
+    std::snprintf(buf, sizeof buf, "%s：DofLink %zu master 项数一致", what, l);
+    checkInt(static_cast<long long>(lb[l].masters.size()),
+             static_cast<long long>(la[l].masters.size()), buf);
+    const size_t nm = la[l].masters.size() < lb[l].masters.size()
+                          ? la[l].masters.size()
+                          : lb[l].masters.size();
+    for (size_t m = 0; m < nm; ++m) {
+      std::snprintf(buf, sizeof buf, "%s：DofLink %zu master %zu dof 一致",
+                    what, l, m);
+      checkInt(lb[l].masters[m].first, la[l].masters[m].first, buf);
+      std::snprintf(buf, sizeof buf, "%s：DofLink %zu master %zu 系数一致",
+                    what, l, m);
+      checkNear(lb[l].masters[m].second, la[l].masters[m].second, 1e-12, buf);
+    }
+  }
+}
+
+static void testT6FullRoundTrip() {
+  std::printf("\n== 8. T6 全量序列化 round-trip（另存为 .yjk）==\n");
+
+  // ---- 8a. frame_wall.yjk → 加构件 → 导出 → 读回，逐字段一致 ----
+  // 测试 CWD = build 目录；候选路径按 ctest 常规布局探测。
+  const char* cands[] = {
+      "../examples/frame_wall.yjk",
+      "examples/frame_wall.yjk",
+      "D:/yjk_like/examples/frame_wall.yjk",
+  };
+  std::string srcText;
+  for (const char* p : cands) {
+    std::ifstream f(p);
+    if (f) {
+      std::ostringstream ss;
+      ss << f.rdbuf();
+      srcText = ss.str();
+      break;
+    }
+  }
+  check(!srcText.empty(), "找到 examples/frame_wall.yjk 并读取");
+  if (srcText.empty()) { ++g_fail; return; }
+
+  io::ModelScript s0;
+  Model src;
+  std::string info;
+  if (!s0.parse(srcText) || !s0.build(src, &info)) {
+    ++g_fail;
+    std::printf("  [FAIL] frame_wall.yjk 解析/建模失败：\n");
+    for (const auto& e : s0.errors()) std::printf("       %s\n", e.c_str());
+    return;
+  }
+  checkInt(src.nodeCount() > 0, true, "frame_wall 建出节点");
+  checkInt(src.elementCount() > 0, true, "frame_wall 建出单元");
+
+  // 加构件（T6 验收：读入后继续编辑，再导出）
+  // 在顶层加一根对角支撑梁，验证"改过的模型也能无损读回"
+  const Material conc = Material::concreteC(30);
+  const SectionProperties brk = section::rect(0.3, 0.4);
+  Id top0 = kDofFixed, top1 = kDofFixed;
+  for (Id n = 0; n < src.nodeCount(); ++n) {
+    if (src.node(n).story < 3 || src.node(n).diaphragmMaster) continue;
+    if (top0 == kDofFixed) top0 = n;
+    else if (top1 == kDofFixed) top1 = n;
+  }
+  check(top0 != kDofFixed && top1 != kDofFixed, "找到顶层两节点");
+  if (top0 == kDofFixed || top1 == kDofFixed) { ++g_fail; return; }
+  check(src.addBeam(top0, top1, brk, conc) != nullptr, "读入模型上追加一根梁");
+
+  // 序列化 → 读回
+  const std::string text = io::modelToYjk(src);
+  check(!text.empty(), "全量序列化成功");
+  if (text.empty()) { ++g_fail; return; }
+  check(text.find("beamsw ") != std::string::npos, "序列化含 beamsw（梁自重）");
+  check(text.find("shellsw ") != std::string::npos, "序列化含 shellsw（墙自重）");
+  check(text.find("shellp ") != std::string::npos, "序列化含 shellp（板面压）");
+  check(text.find("diaphragm.bind") == std::string::npos,
+        "frame_wall 无楼板 → 序列化无 diaphragm.bind（原脚本未开 diaphragm）");
+
+  io::ModelScript s1;
+  Model dst;
+  if (!s1.parse(text) || !s1.build(dst, &info)) {
+    ++g_fail;
+    std::printf("  [FAIL] 序列化脚本读回失败：\n");
+    for (const auto& e : s1.errors()) std::printf("       %s\n", e.c_str());
+    return;
+  }
+  checkT6ModelEq(src, dst, "8a frame_wall round-trip");
+
+  // ---- 8b. 刚性楼板 round-trip：手动建楼板 → 导出 → 读回 ----
+  std::printf("  -- 刚性楼板 round-trip --\n");
+  Model s2;
+  const Id p0 = s2.addNode(Vec3{0, 0, 0}, 1);
+  const Id p1 = s2.addNode(Vec3{6, 0, 0}, 1);
+  const Id p2n = s2.addNode(Vec3{6, 6, 0}, 1);
+  const Id p3 = s2.addNode(Vec3{0, 6, 0}, 1);
+  const Id p4 = s2.addNode(Vec3{3, 3, 0}, 1);   // 板内节点
+  const Id pb0 = s2.addNode(Vec3{0, 0, -3.9}, 0);
+  const Material cc = Material::concreteC(30);
+  s2.addColumn(p0, pb0, section::rect(0.5, 0.5), cc);
+  s2.addBeam(p0, p1, section::rect(0.3, 0.6), cc);
+  const Id mid = s2.addRigidDiaphragm({p0, p1, p2n, p3, p4}, 1, true);
+  check(mid != kDofFixed, "8b 手动建刚性楼板成功（主节点）");
+  checkInt(s2.diaphragms().size(), 1, "8b 楼板记录 1 条");
+  // 主节点附加一个节点荷载，验证主节点也走序列化
+  s2.addNodeLoad(mid, Vec3{0, 0, 0}, Vec3{0, 0, 1});
+  const std::string text2 = io::modelToYjk(s2);
+  check(text2.find("diaphragm.bind") != std::string::npos,
+        "8b 序列化含 diaphragm.bind");
+  io::ModelScript s3;
+  Model d2;
+  if (!s3.parse(text2) || !s3.build(d2, &info)) {
+    ++g_fail;
+    std::printf("  [FAIL] 8b 楼板脚本读回失败：\n");
+    for (const auto& e : s3.errors()) std::printf("       %s\n", e.c_str());
+    return;
+  }
+  checkT6ModelEq(s2, d2, "8b 刚性楼板 round-trip");
+  check(d2.node(mid).diaphragmMaster, "8b 读回后主节点标记 diaphragmMaster");
+  checkVecNear(d2.node(mid).moment, Vec3{0, 0, 1}, 1e-12,
+               "8b 读回主节点力矩一致");
+}
 
 // 逐字段比对两个模型（节点坐标 / 层号 / 荷载，单元类型 / 节点引用 / 属性）
 static void checkModelEq(const Model& a, const Model& b, const char* what) {
@@ -881,6 +1159,7 @@ int main() {
   testPropertyEdit();
   testBuildOps();
   testCommandStack();
+  testT6FullRoundTrip();
 
   std::printf("\n====  test_interact：%d 通过，%d 失败 ====\n", g_pass, g_fail);
   return g_fail == 0 ? 0 : 1;
