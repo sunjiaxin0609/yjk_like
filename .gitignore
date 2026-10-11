@@ -45,3 +45,9 @@ ui_*.h
 /frame_wall.*
 /mini_wall.*
 /single_wall.*
+
+# 工具/交付临时产物（均可重新生成，已移出版本控制）
+.tmp/
+*.zip
+shot_*.png
+blank-project-assessment.html
