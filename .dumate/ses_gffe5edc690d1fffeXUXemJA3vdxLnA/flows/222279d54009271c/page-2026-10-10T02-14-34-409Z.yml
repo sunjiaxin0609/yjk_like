@@ -1,0 +1,251 @@
+- generic [ref=e2]:
+  - banner [ref=e3]:
+    - heading "「新建空白工程」改动范围评估" [level=1] [ref=e4]
+    - generic [ref=e5]: yjk_like · 评估日期 2026-10-10 · 依据：源码逐行核实（GridMesh.h / Model.h / CommandStack.h / BuildOps.h / MainWindow.cpp / main.cpp / yjk.cpp）
+  - generic [ref=e6]:
+    - text: 结论：可做，且比预想的小。核心层约 80% 的能力已经存在——
+    - code [ref=e7]: Model
+    - text: 支持空构造、
+    - code [ref=e8]: GridMesh
+    - text: 是完整可独立调用的纯 C++ 轴网生成 API、
+    - code [ref=e9]: CommandStack
+    - text: （撤销/重做）、
+    - code [ref=e10]: modelToYjk
+    - text: （另存为 .yjk）与 View3D 拾取基础设施全部现成。 缺的只是三个 GUI 入口：① 文件菜单「新建」动作；② 空白模型的正确初始化链路； ③ 轴网生成对话框（或手动加节点工具）。
+  - heading "1. 目标定义" [level=2] [ref=e11]
+  - paragraph [ref=e12]:
+    - text: 「新建空白工程」= 从 GUI 直接开始一个全新模型，不依赖任何已有
+    - code [ref=e13]: .yjk
+    - text: 脚本，完整闭环为：
+  - generic [ref=e14]: 文件 → 新建空白工程 → 生成轴网（对话框）→ 拾取增补构件（B/C/W/P/L，已实现） → 属性编辑（已实现）→ 撤销/重做（已实现）→ 另存为 .yjk（已实现）→ F5 计算（已实现）
+  - paragraph [ref=e15]: 即：补齐起点（新建 + 轴网），其余链路全部复用现有实现。
+  - heading "2. 现状核实（逐条代码依据）" [level=2] [ref=e16]
+  - heading "2.1 缺：GUI 无「新建」入口" [level=3] [ref=e17]
+  - paragraph [ref=e18]:
+    - generic [ref=e19]: 缺口
+    - text: 文件菜单（
+    - code [ref=e20]: apps/ui/MainWindow.cpp:259-271
+    - text: ）只有 打开建模脚本 / 重新加载 / 另存为 .yjk / 导出，无「新建」。唯一加载路径是
+    - code [ref=e21]: openScript(path)
+    - text: （
+    - code [ref=e22]: MainWindow.cpp:667
+    - text: ）， 无脚本时 F5 会强制走示例文件（
+    - code [ref=e23]: MainWindow.cpp:1009-1028
+    - text: ）。
+  - heading "2.2 有：核心可空构造" [level=3] [ref=e24]
+  - paragraph [ref=e25]:
+    - generic [ref=e26]: 现成
+    - code [ref=e27]: Model() = default
+    - text: 与
+    - code [ref=e28]: Model::clear()
+    - text: （
+    - code [ref=e29]: Model.h:673-676, 761
+    - text: ）—— 空模型直接可用，不需要任何初始化脚手架。
+  - heading "2.3 有：轴网生成 API 完整（最大复用资产）" [level=3] [ref=e30]
+  - paragraph [ref=e31]:
+    - generic [ref=e32]: 现成
+    - code [ref=e33]: GridMesh
+    - text: 是无 Qt 依赖的纯 C++ 类，
+    - code [ref=e34]: ModelScript.cpp:742-908
+    - text: 的
+    - code [ref=e35]: grid.*
+    - text: 命令全部是对它的直接调用。已具备：
+  - list [ref=e36]:
+    - listitem [ref=e37]:
+      - text: 轴线：
+      - code [ref=e38]: addAxisX(y) / addAxisY(x) / addStory(z)
+    - listitem [ref=e39]:
+      - text: 构件事项：
+      - code [ref=e40]: setColumn / setBeamAlongX/Y / setSlab / setWallAlongX/Y
+    - listitem [ref=e41]:
+      - text: 剖分：
+      - code [ref=e42]: setDivX / setDivY
+      - text: （梁板节点天然重合的机制已内置）
+    - listitem [ref=e43]:
+      - text: 生成：
+      - code [ref=e44]: generate(Model&)
+      - text: 一步产出节点/单元； 返回
+      - code [ref=e45]: Result
+      - text: ，失败带可读诊断（现有 63 项测试覆盖）
+    - listitem [ref=e46]:
+      - text: 刚性楼板：
+      - code [ref=e47]: addRigidDiaphragms
+      - text: 可直接调用
+  - heading "2.4 有：撤销/重做、序列化、拾取全部现成" [level=3] [ref=e48]
+  - table [ref=e49]:
+    - rowgroup [ref=e50]:
+      - row "能力 位置 现状" [ref=e51]:
+        - columnheader "能力" [ref=e52]
+        - columnheader "位置" [ref=e53]
+        - columnheader "现状" [ref=e54]
+      - row "撤销/重做（Ctrl+Z/Y） CommandStack.h / MainWindow.h:170 现成 整模型快照栈，clear() 已用于换模型" [ref=e55]:
+        - cell "撤销/重做（Ctrl+Z/Y）" [ref=e56]
+        - cell "CommandStack.h / MainWindow.h:170" [ref=e57]
+        - cell "现成 整模型快照栈，clear() 已用于换模型" [ref=e58]:
+          - generic [ref=e59]: 现成
+          - text: 整模型快照栈，
+          - code [ref=e60]: clear()
+          - text: 已用于换模型
+      - row "另存为 .yjk MainWindow.cpp:1262 (onSaveAsYjk) 现成 modelToYjk(*model_) 任意模型可序列化；空模型也可存" [ref=e61]:
+        - cell "另存为 .yjk" [ref=e62]
+        - cell "MainWindow.cpp:1262 (onSaveAsYjk)" [ref=e63]
+        - cell "现成 modelToYjk(*model_) 任意模型可序列化；空模型也可存" [ref=e64]:
+          - generic [ref=e65]: 现成
+          - code [ref=e66]: modelToYjk(*model_)
+          - text: 任意模型可序列化；空模型也可存
+      - row "视口拾取 View3D.cpp:703, 925, 967 + PickCore.h 现成 unproject 射线、点选/框选节点（Ray3 / raySegHit）" [ref=e67]:
+        - cell "视口拾取" [ref=e68]
+        - cell "View3D.cpp:703, 925, 967 + PickCore.h" [ref=e69]
+        - cell "现成 unproject 射线、点选/框选节点（Ray3 / raySegHit）" [ref=e70]:
+          - generic [ref=e71]: 现成
+          - text: unproject 射线、点选/框选节点（Ray3 / raySegHit）
+      - row "增补构件工具 BuildOps.h/.cpp（B/C/W/P/L） 现成 但全部依赖已存在节点（校验即\"节点不存在\"，BuildOps.cpp:29,91,188）" [ref=e72]:
+        - cell "增补构件工具" [ref=e73]
+        - cell "BuildOps.h/.cpp（B/C/W/P/L）" [ref=e74]
+        - cell "现成 但全部依赖已存在节点（校验即\"节点不存在\"，BuildOps.cpp:29,91,188）" [ref=e75]:
+          - generic [ref=e76]: 现成
+          - text: 但全部依赖已存在节点（校验即"节点不存在"，
+          - code [ref=e77]: BuildOps.cpp:29,91,188
+          - text: ）
+      - row "重新加载 MainWindow.cpp:onReload 需配套 已对 scriptPath_.isEmpty() 有提示，新建后自动满足" [ref=e78]:
+        - cell "重新加载" [ref=e79]
+        - cell "MainWindow.cpp:onReload" [ref=e80]
+        - cell "需配套 已对 scriptPath_.isEmpty() 有提示，新建后自动满足" [ref=e81]:
+          - generic [ref=e82]: 需配套
+          - text: 已对
+          - code [ref=e83]: scriptPath_.isEmpty()
+          - text: 有提示，新建后自动满足
+  - heading "3. 改动范围（三档方案）" [level=2] [ref=e84]
+  - heading "方案 A：最小可行（新建入口 + 空模型初始化）—— 约 0.5 人日" [level=3] [ref=e85]
+  - generic [ref=e86]:
+    - paragraph [ref=e87]:
+      - text: 改动：
+      - code [ref=e88]: MainWindow.cpp/.h
+      - text: 新增「新建空白工程」动作：
+    - list [ref=e89]:
+      - listitem [ref=e90]:
+        - text: 生成
+        - code [ref=e91]: make_unique<Model>()
+        - text: 空模型；
+      - listitem [ref=e92]:
+        - text: 依次调用现成重置链：
+        - code [ref=e93]: clearResults() → cmds_->clear() → updateCmdState() → publishModel() → view_->frameAll()
+        - text: （与
+        - code [ref=e94]: MainWindow.cpp:689-700
+        - text: 打开新文件后的复位逻辑等价）；
+      - listitem [ref=e95]:
+        - code [ref=e96]: scriptPath_
+        - text: 置空、状态栏提示"空白工程"。
+    - paragraph [ref=e97]:
+      - text: 局限：若无「加节点」工具，B/C/W/P/L 在空模型上无处下手——需要叠加 View3D 新增
+      - code [ref=e98]: BuildTool::Node
+      - text: （点空白处放一个节点，用现有 unproject 射线定坐标）。 该档单独不构成完整闭环，宜与方案 B 合并实施。
+  - heading "方案 B：推荐（A + 轴网生成对话框）—— 约 2～3 人日" [level=3] [ref=e99]
+  - generic [ref=e100]:
+    - paragraph [ref=e101]: 改动：
+    - list [ref=e102]:
+      - listitem [ref=e103]:
+        - text: 新文件
+        - code [ref=e104]: "apps/ui/NewProjectDialog.{h,cpp}"
+        - text: ：输入轴距（X/Y）、层高、材料/截面名、板厚、剖分数、是否生成柱/梁/板/墙；
+      - listitem [ref=e105]:
+        - text: 对话框「确定」后构建
+        - code [ref=e106]: GridMesh
+        - text: ：
+        - code [ref=e107]: addAxisX/addAxisY/addStory → setColumn/setBeam/setSlab → generate(model)
+        - text: ， GridMesh 与测试零改动（纯复用）；
+      - listitem [ref=e108]:
+        - text: 生成结果入撤销栈：
+        - code [ref=e109]: cmds_->push(before, after)
+        - text: 一次快照即可「撤销轴网」；
+      - listitem [ref=e110]: 后续用现有 B/C/W/P/L 工具在节点上增补/编辑。
+    - paragraph [ref=e111]: 收益：一条命令完成"新建 + 搭骨架"，闭环完整；复用 GridMesh 63 项成熟测试， 新增风险集中在纯 GUI 层。
+  - heading "方案 C：增强（向导 + 手动加节点 + 网格吸附）—— 约 5人日+" [level=3] [ref=e112]
+  - paragraph [ref=e114]: 在 B 之上：① 轴网对话框支持随时修改轴线后续增量重建；② View3D 新增"放节点"工具与 轴线/交点吸附；③ 空模型拖拽建模。改动横跨 View3D 事件与 GridMesh 增量接口， 建议作为后续迭代，不在首版范围。
+  - table [ref=e115]:
+    - rowgroup [ref=e116]:
+      - row "对比 A 最小 B 推荐 C 增强" [ref=e117]:
+        - columnheader "对比" [ref=e118]
+        - columnheader "A 最小" [ref=e119]
+        - columnheader "B 推荐" [ref=e120]
+        - columnheader "C 增强" [ref=e121]
+      - row "新建菜单入口 ✅ ✅ ✅" [ref=e122]:
+        - cell "新建菜单入口" [ref=e123]
+        - cell "✅" [ref=e124]
+        - cell "✅" [ref=e125]
+        - cell "✅" [ref=e126]
+      - row "完整闭环（新建→可算） ❌ 缺节点来源 ✅ ✅" [ref=e127]:
+        - cell "完整闭环（新建→可算）" [ref=e128]
+        - cell "❌ 缺节点来源" [ref=e129]
+        - cell "✅" [ref=e130]
+        - cell "✅" [ref=e131]
+      - row "改动文件 MainWindow ± + NewProjectDialog、MainWindow + View3D/BuildOps/GridMesh" [ref=e132]:
+        - cell "改动文件" [ref=e133]
+        - cell "MainWindow ±" [ref=e134]
+        - cell "+ NewProjectDialog、MainWindow" [ref=e135]
+        - cell "+ View3D/BuildOps/GridMesh" [ref=e136]
+      - row "涉及行数（估） 60～100 250～400 800+" [ref=e137]:
+        - cell "涉及行数（估）" [ref=e138]
+        - cell "60～100" [ref=e139]
+        - cell "250～400" [ref=e140]
+        - cell "800+" [ref=e141]
+      - row "人日（估） 0.5 2～3 5+" [ref=e142]:
+        - cell "人日（估）" [ref=e143]
+        - cell "0.5" [ref=e144]
+        - cell "2～3" [ref=e145]
+        - cell "5+" [ref=e146]
+      - row "风险 低（纯 UI） 低（复用核心） 中（动核心交互）" [ref=e147]:
+        - cell "风险" [ref=e148]
+        - cell "低（纯 UI）" [ref=e149]
+        - cell "低（复用核心）" [ref=e150]
+        - cell "中（动核心交互）" [ref=e151]
+      - row "回归面 GUI 菜单 GUI + 首条端到端 核心 + GUI" [ref=e152]:
+        - cell "回归面" [ref=e153]
+        - cell "GUI 菜单" [ref=e154]
+        - cell "GUI + 首条端到端" [ref=e155]
+        - cell "核心 + GUI" [ref=e156]
+  - heading "4. 建议的路线落点" [level=2] [ref=e157]
+  - generic [ref=e158]:
+    - paragraph [ref=e159]:
+      - text: 当前路线：
+      - generic [ref=e160]: P4 规范验算与配筋（进行中）
+      - generic [ref=e161]: P5 工程化
+      - text: 。
+    - paragraph [ref=e162]: 建议：以 「P4 并行小里程碑 · P4-D1 交互建模闭环补全」 立项，理由：
+    - list [ref=e163]:
+      - listitem [ref=e164]: 与 P4 解耦：不触碰验算/配筋数据流，无依赖冲突，可并行；
+      - listitem [ref=e165]: 收益前置：P4-T5 配筋实配需要「工程师能从空白建出真实工程」做验收载体验证， 空白建模恰是前置条件；
+      - listitem [ref=e166]: 风险可控：核心全部复用，改动集中在 GUI 一层，回归只需 1 条端到端用例 （新建 → 轴网 → 增补 → 另存 → run），与现有 23 个测试目标互不干扰。
+    - paragraph [ref=e167]: 里程碑划分（每步独立可验收、单独 commit）：
+    - list [ref=e168]:
+      - listitem [ref=e169]: D1-1 新建空白工程：菜单动作 + 空白初始化链路（复用 §2.4 重置链），0.5 人日；
+      - listitem [ref=e170]: D1-2 轴网生成对话框：NewProjectDialog 调 GridMesh 生成 + 撤销入栈，1.5～2 人日； 验收：新建后直接 F5 可算出结果，Ctrl+Z 可撤销整个轴网；
+      - listitem [ref=e171]:
+        - text: D1-3 端到端用例：
+        - code [ref=e172]: ui
+        - text: 无头脚本新场景 （
+        - code [ref=e173]: "--script 内建空白 → 生成 → run"
+        - text: ），并入现有 ctest，0.5 人日。
+  - heading "5. 风险与注意" [level=2] [ref=e174]
+  - list [ref=e175]:
+    - listitem [ref=e176]:
+      - text: 空模型直接 F5：现有
+      - code [ref=e177]: onRun
+      - text: 无模型时会弹示例选择—— 加入空白工程后需区分「从未打开过」与「刚新建空白」，建议新建时给
+      - code [ref=e178]: scriptPath_
+      - text: 标记空态，F5 直接走空模型求解（提示"无约束/无荷载"由现有 check 给出即可）。
+    - listitem [ref=e179]:
+      - text: 另存为 .yjk：空/半成品模型经
+      - code [ref=e180]: modelToYjk
+      - text: 会输出 node/beam/shell （显式节点式脚本），可正常回读——已确认该路径存在；需补一条 「新建设计 → 另存 → 重新打开」回归用例。
+    - listitem [ref=e181]:
+      - text: 材料/截面引用：轴网对话框若由用户自定义材料名，需与
+      - code [ref=e182]: ModelScript
+      - text: 的
+      - code [ref=e183]: material/section
+      - text: 解析保持一致 （对话框可直接生成等价脚本命令再复用
+      - code [ref=e184]: ModelScript
+      - text: ，减少双实现）。
+  - heading "6. 结论" [level=2] [ref=e185]
+  - paragraph [ref=e186]: 「新建空白工程」对 yjk_like 属于中低复杂度、低风险的需求：核心层已提供 空模型、轴网生成、撤销重做、序列化四大现成能力，GUI 层只缺 2～3 个入口。 按方案 B 实施约 2～3 人日，可作为 P4 并行小里程碑推进；首版不做 手动加节点/网格吸附（方案 C），留待后续增强。
+  - paragraph [ref=e187]: —— 本报告所有"现成/缺口"判断均基于当前源码（2026-10-10）逐行核实； 工作量为人日量级估算，未含跨平台回归成本。
